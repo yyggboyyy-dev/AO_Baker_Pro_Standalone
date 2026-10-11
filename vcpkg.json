@@ -1,16 +1,20 @@
 {
   "name": "ao-baker-pro-standalone",
   "version-string": "1.0.0",
-  "builtin-baseline": "1f7f9619087212a4b7eaf6f4b1b6e9f0f4d3f5e8",
   "dependencies": [
     {
       "name": "qtbase",
       "default-features": false,
-      "features": ["widgets", "opengl"]
+      "features": [
+        "widgets",
+        "opengl"
+      ]
     },
     {
       "name": "assimp",
-      "features": ["zlib"]
+      "features": [
+        "zlib"
+      ]
     },
     "glm",
     "stb"
