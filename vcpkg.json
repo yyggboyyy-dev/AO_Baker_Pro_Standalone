@@ -10,12 +10,7 @@
         "opengl"
       ]
     },
-    {
-      "name": "assimp",
-      "features": [
-        "zlib"
-      ]
-    },
+    "assimp",
     "glm",
     "stb"
   ]
