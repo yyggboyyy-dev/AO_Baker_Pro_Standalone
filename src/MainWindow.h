@@ -13,7 +13,6 @@
 #include <QSpinBox>
 #include <QCheckBox>
 #include <QPushButton>
-#include <QFutureWatcher>
 
 class SliderRow : public QWidget {
     Q_OBJECT
