@@ -18,7 +18,6 @@
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QAction>
-#include <QtConcurrent/QtConcurrent>
 #include <cmath>
 
 SliderRow::SliderRow(float min, float max, float value, int decimals, QWidget* parent)
