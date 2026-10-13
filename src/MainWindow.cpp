@@ -19,7 +19,10 @@
 #include <QVBoxLayout>
 #include <QAction>
 #include <QVariant>
+#include <QVector3D>
+#include <algorithm>
 #include <cmath>
+#include <utility>
 
 SliderRow::SliderRow(float min, float max, float value, int decimals, QWidget* parent)
     : QWidget(parent), m_min(min), m_max(max), m_decimals(decimals), m_scale(int(std::pow(10, decimals))) {
@@ -73,6 +76,7 @@ void MainWindow::buildUi() {
     toolbar->addSeparator();
     toolbar->addAction("烘焙AO到顶点色", this, &MainWindow::bakeVertex);
     toolbar->addAction("烘焙AO到贴图", this, &MainWindow::bakeTexture);
+    toolbar->addAction("修复面片朝向", this, &MainWindow::repairFaceOrientation);
     toolbar->addAction("清空场景", this, &MainWindow::clearScene);
 
     auto* root = new QSplitter(Qt::Horizontal, this);
@@ -166,9 +170,24 @@ QWidget* MainWindow::buildSettingsPanel() {
     auto* adaptive = new QCheckBox("自适应采样", this);
     adaptive->setChecked(true);
     connect(adaptive, &QCheckBox::toggled, this, [this](bool v){ m_settings.adaptiveSampling = v; onSettingsChanged(); });
+    auto* wireframe = new QCheckBox("显示模型网格线框", this);
+    wireframe->setChecked(true);
+    connect(wireframe, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setWireframeVisible(v); });
+    auto* useVertexColor = new QCheckBox("显示顶点色 / AO 结果", this);
+    useVertexColor->setChecked(true);
+    connect(useVertexColor, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setUseVertexColor(v); });
+    auto* materialRow = new QWidget(this);
+    auto* materialLayout = new QHBoxLayout(materialRow);
+    materialLayout->setContentsMargins(0,0,0,0);
+    m_materialColorButton = new QPushButton("#bcc6d2", this);
+    connect(m_materialColorButton, &QPushButton::clicked, this, &MainWindow::chooseMaterialColor);
+    materialLayout->addWidget(m_materialColorButton);
     form->addRow(keepSmooth);
     form->addRow(keepUv);
     form->addRow(adaptive);
+    form->addRow(wireframe);
+    form->addRow(useVertexColor);
+    form->addRow("默认材质颜色", materialRow);
     return box;
 }
 
@@ -256,6 +275,16 @@ void MainWindow::chooseGroundColor() {
     }
 }
 
+void MainWindow::chooseMaterialColor() {
+    const QColor initial = m_materialColorButton ? QColor(m_materialColorButton->text()) : QColor(188, 198, 210);
+    const QColor c = QColorDialog::getColor(initial, this, "选择默认材质颜色");
+    if (c.isValid()) {
+        if (m_materialColorButton) m_materialColorButton->setText(c.name());
+        if (m_viewport) m_viewport->setDefaultMaterialColor(c);
+        log("默认材质颜色已切换：" + c.name());
+    }
+}
+
 QString MainWindow::outputBaseName(const QString& suffix) const {
     QDir().mkpath(m_outputDir);
     return m_outputDir + "/" + QFileInfo(m_scene.sourcePath).completeBaseName() + suffix;
@@ -325,6 +354,82 @@ void MainWindow::onSettingsChanged() {
         m_viewport->setBakeSettings(m_settings);
     }
     statusBar()->showMessage("AO 参数已更新，视口实时预览已刷新", 1500);
+}
+
+void MainWindow::recalculateNormals() {
+    for (auto& mesh : m_scene.meshes) {
+        for (auto& vertex : mesh.vertices) {
+            vertex.normal = QVector3D(0, 0, 0);
+        }
+        for (const auto& face : mesh.faces) {
+            if (face.i0 < 0 || face.i1 < 0 || face.i2 < 0 ||
+                face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size()) {
+                continue;
+            }
+            const QVector3D a = mesh.vertices[face.i0].position;
+            const QVector3D b = mesh.vertices[face.i1].position;
+            const QVector3D c = mesh.vertices[face.i2].position;
+            const QVector3D n = QVector3D::crossProduct(b - a, c - a);
+            mesh.vertices[face.i0].normal += n;
+            mesh.vertices[face.i1].normal += n;
+            mesh.vertices[face.i2].normal += n;
+        }
+        for (auto& vertex : mesh.vertices) {
+            vertex.normal = vertex.normal.lengthSquared() > 1e-8f ? vertex.normal.normalized() : QVector3D(0, 0, 1);
+        }
+        mesh.hasNormals = true;
+    }
+}
+
+void MainWindow::repairFaceOrientation() {
+    if (m_scene.empty()) {
+        QMessageBox::warning(this, "缺少模型", "请先导入模型。");
+        return;
+    }
+
+    QVector3D minV(1e9f, 1e9f, 1e9f), maxV(-1e9f, -1e9f, -1e9f);
+    bool hasVertex = false;
+    for (const auto& mesh : m_scene.meshes) {
+        for (const auto& v : mesh.vertices) {
+            hasVertex = true;
+            minV.setX(std::min(minV.x(), v.position.x()));
+            minV.setY(std::min(minV.y(), v.position.y()));
+            minV.setZ(std::min(minV.z(), v.position.z()));
+            maxV.setX(std::max(maxV.x(), v.position.x()));
+            maxV.setY(std::max(maxV.y(), v.position.y()));
+            maxV.setZ(std::max(maxV.z(), v.position.z()));
+        }
+    }
+    if (!hasVertex) return;
+
+    const QVector3D center = (minV + maxV) * 0.5f;
+    int flipped = 0;
+    for (auto& mesh : m_scene.meshes) {
+        for (auto& face : mesh.faces) {
+            if (face.i0 < 0 || face.i1 < 0 || face.i2 < 0 ||
+                face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size()) {
+                continue;
+            }
+            const QVector3D a = mesh.vertices[face.i0].position;
+            const QVector3D b = mesh.vertices[face.i1].position;
+            const QVector3D c = mesh.vertices[face.i2].position;
+            const QVector3D normal = QVector3D::crossProduct(b - a, c - a);
+            const QVector3D faceCenter = (a + b + c) / 3.0f;
+            if (normal.lengthSquared() > 1e-8f && QVector3D::dotProduct(normal, faceCenter - center) < 0.0f) {
+                std::swap(face.i1, face.i2);
+                ++flipped;
+            }
+        }
+    }
+
+    recalculateNormals();
+    if (m_viewport) {
+        m_viewport->setScene(&m_scene);
+        m_viewport->setBakeSettings(m_settings);
+    }
+    const QString msg = QString("面片朝向修复完成：已翻转 %1 个疑似反向三角面，并重新计算法线。") .arg(flipped);
+    log(msg);
+    QMessageBox::information(this, "修复完成", msg);
 }
 
 void MainWindow::clearScene() {

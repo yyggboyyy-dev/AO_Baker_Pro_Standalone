@@ -38,6 +38,21 @@ void ViewportWidget::setRealtimePreviewEnabled(bool enabled) {
     update();
 }
 
+void ViewportWidget::setWireframeVisible(bool visible) {
+    m_wireframeVisible = visible;
+    update();
+}
+
+void ViewportWidget::setDefaultMaterialColor(const QColor& color) {
+    m_defaultMaterialColor = color;
+    update();
+}
+
+void ViewportWidget::setUseVertexColor(bool enabled) {
+    m_useVertexColor = enabled;
+    update();
+}
+
 void ViewportWidget::setSelectedMesh(int meshIndex) {
     m_selectedMesh = meshIndex;
     update();
@@ -113,7 +128,7 @@ ViewportWidget::ProjectedVertex ViewportWidget::projectVertex(const QVector3D& w
 }
 
 QColor ViewportWidget::previewColor(const MeshData& mesh, const Vertex& v, int meshIndex) const {
-    QColor base = mesh.hasVertexColor ? v.color : QColor(188, 198, 210);
+    QColor base = (m_useVertexColor && mesh.hasVertexColor) ? v.color : m_defaultMaterialColor;
 
     if (m_realtimePreview) {
         QVector3D n = v.normal.lengthSquared() > 0.00001f ? v.normal.normalized() : QVector3D(0, 1, 0);
@@ -176,11 +191,11 @@ void ViewportWidget::drawOverlay(QPainter& p) const {
         .arg(m_scene ? m_scene->faceCount() : 0)
         .arg(selected));
     p.drawText(14, height() - 42, "Maya 操作：Alt+左键旋转 / Alt+中键平移 / Alt+右键缩放 / 滚轮缩放 / F 重置视图 / 鼠标左键点选模型");
-    p.drawText(14, height() - 20, QString("实时预览：%1    AO强度 %2    最暗 %3    最亮 %4")
+    p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    显示顶点色：%3    材质色：%4")
         .arg(m_realtimePreview ? "开启" : "关闭")
-        .arg(m_settings.aoStrength, 0, 'f', 2)
-        .arg(m_settings.darkest, 0, 'f', 2)
-        .arg(m_settings.brightest, 0, 'f', 2));
+        .arg(m_wireframeVisible ? "开启" : "关闭")
+        .arg(m_useVertexColor ? "开启" : "关闭")
+        .arg(m_defaultMaterialColor.name()));
     p.restore();
 }
 
@@ -228,13 +243,15 @@ void ViewportWidget::paintGL() {
         p.drawPolygon(QPolygonF({t.a, t.b, t.c}));
     }
 
-    p.setBrush(Qt::NoBrush);
-    for (const auto& t : triangles) {
-        const bool selected = t.meshIndex == m_selectedMesh;
-        p.setPen(QPen(selected ? QColor(255, 176, 40) : QColor(78, 88, 101), selected ? 2 : 1));
-        p.drawLine(t.a, t.b);
-        p.drawLine(t.b, t.c);
-        p.drawLine(t.c, t.a);
+    if (m_wireframeVisible) {
+        p.setBrush(Qt::NoBrush);
+        for (const auto& t : triangles) {
+            const bool selected = t.meshIndex == m_selectedMesh;
+            p.setPen(QPen(selected ? QColor(255, 176, 40) : QColor(78, 88, 101), selected ? 2 : 1));
+            p.drawLine(t.a, t.b);
+            p.drawLine(t.b, t.c);
+            p.drawLine(t.c, t.a);
+        }
     }
 
     drawOverlay(p);

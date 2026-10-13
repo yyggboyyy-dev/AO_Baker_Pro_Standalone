@@ -14,6 +14,9 @@ public:
     void setScene(const SceneData* scene);
     void setBakeSettings(const BakeSettings& settings);
     void setRealtimePreviewEnabled(bool enabled);
+    void setWireframeVisible(bool visible);
+    void setDefaultMaterialColor(const QColor& color);
+    void setUseVertexColor(bool enabled);
     void setSelectedMesh(int meshIndex);
     int selectedMesh() const { return m_selectedMesh; }
 
@@ -49,6 +52,9 @@ private:
     const SceneData* m_scene = nullptr;
     BakeSettings m_settings;
     bool m_realtimePreview = true;
+    bool m_wireframeVisible = true;
+    bool m_useVertexColor = true;
+    QColor m_defaultMaterialColor = QColor(188, 198, 210);
     int m_selectedMesh = -1;
 
     float m_yaw = -35.0f;

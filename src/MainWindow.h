@@ -40,6 +40,8 @@ private slots:
     void importModel();
     void chooseOutputDir();
     void chooseGroundColor();
+    void chooseMaterialColor();
+    void repairFaceOrientation();
     void bakeVertex();
     void bakeTexture();
     void clearScene();
@@ -55,6 +57,7 @@ private:
     void refreshSceneInfo();
     void log(const QString& text);
     void runBake(bool texture);
+    void recalculateNormals();
     QString outputBaseName(const QString& suffix) const;
 
     SceneData m_scene;
@@ -68,6 +71,7 @@ private:
     ViewportWidget* m_viewport = nullptr;
     QLabel* m_outputLabel = nullptr;
     QPushButton* m_colorButton = nullptr;
+    QPushButton* m_materialColorButton = nullptr;
     QComboBox* m_resolution = nullptr;
     QComboBox* m_format = nullptr;
 };
