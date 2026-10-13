@@ -43,6 +43,8 @@ private slots:
     void bakeVertex();
     void bakeTexture();
     void clearScene();
+    void onMeshSelected(int meshIndex, const QString& meshName);
+    void onSettingsChanged();
 
 private:
     void buildUi();

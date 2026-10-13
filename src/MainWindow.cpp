@@ -18,6 +18,7 @@
 #include <QToolBar>
 #include <QVBoxLayout>
 #include <QAction>
+#include <QVariant>
 #include <cmath>
 
 SliderRow::SliderRow(float min, float max, float value, int decimals, QWidget* parent)
@@ -81,6 +82,11 @@ void MainWindow::buildUi() {
     auto* leftLayout = new QVBoxLayout(left);
     m_tree = new QTreeWidget(this);
     m_tree->setHeaderLabel("模型");
+    connect(m_tree, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem* item, int){
+        if (!item || !m_viewport) return;
+        const int meshIndex = item->data(0, Qt::UserRole).toInt();
+        m_viewport->setSelectedMesh(meshIndex);
+    });
     m_modelInfo = new QLabel("未导入模型", this);
     m_modelInfo->setWordWrap(true);
     m_uvInfo = new QLabel("UV 通道：未检测", this);
@@ -95,6 +101,7 @@ void MainWindow::buildUi() {
     auto* center = new QWidget(this);
     auto* centerLayout = new QVBoxLayout(center);
     m_viewport = new ViewportWidget(this);
+    connect(m_viewport, &ViewportWidget::meshSelected, this, &MainWindow::onMeshSelected);
     centerLayout->addWidget(m_viewport, 5);
     auto* bakePanel = new QWidget(this);
     auto* bakeLayout = new QHBoxLayout(bakePanel);
@@ -128,37 +135,37 @@ QWidget* MainWindow::buildSettingsPanel() {
         connect(row, &SliderRow::valueChanged, this, setter);
         form->addRow(name, row);
     };
-    addSlider("AO 强度", 0, 3, m_settings.aoStrength, [this](float v){ m_settings.aoStrength = v; });
+    addSlider("AO 强度", 0, 3, m_settings.aoStrength, [this](float v){ m_settings.aoStrength = v; onSettingsChanged(); });
     auto* colorRow = new QWidget(this);
     auto* colorLayout = new QHBoxLayout(colorRow);
     colorLayout->setContentsMargins(0,0,0,0);
     m_colorButton = new QPushButton(m_settings.groundBounceColor.name(), this);
     connect(m_colorButton, &QPushButton::clicked, this, &MainWindow::chooseGroundColor);
     auto* ground = new SliderRow(0, 2, m_settings.groundBounceStrength, 2, this);
-    connect(ground, &SliderRow::valueChanged, this, [this](float v){ m_settings.groundBounceStrength = v; });
+    connect(ground, &SliderRow::valueChanged, this, [this](float v){ m_settings.groundBounceStrength = v; onSettingsChanged(); });
     colorLayout->addWidget(m_colorButton);
     colorLayout->addWidget(ground, 1);
     form->addRow("地面反光", colorRow);
-    addSlider("过渡范围", 0, 1, m_settings.transitionSmoothness, [this](float v){ m_settings.transitionSmoothness = v; });
-    addSlider("过渡对比度", 0.2f, 4, m_settings.transitionContrast, [this](float v){ m_settings.transitionContrast = v; });
-    addSlider("最暗处", 0, 1, m_settings.darkest, [this](float v){ m_settings.darkest = v; });
-    addSlider("最亮处", 0, 1, m_settings.brightest, [this](float v){ m_settings.brightest = v; });
+    addSlider("过渡范围", 0, 1, m_settings.transitionSmoothness, [this](float v){ m_settings.transitionSmoothness = v; onSettingsChanged(); });
+    addSlider("过渡对比度", 0.2f, 4, m_settings.transitionContrast, [this](float v){ m_settings.transitionContrast = v; onSettingsChanged(); });
+    addSlider("最暗处", 0, 1, m_settings.darkest, [this](float v){ m_settings.darkest = v; onSettingsChanged(); });
+    addSlider("最亮处", 0, 1, m_settings.brightest, [this](float v){ m_settings.brightest = v; onSettingsChanged(); });
     auto* samples = new QSpinBox(this);
     samples->setRange(16, 4096);
     samples->setValue(m_settings.sampleCount);
-    connect(samples, &QSpinBox::valueChanged, this, [this](int v){ m_settings.sampleCount = v; });
+    connect(samples, &QSpinBox::valueChanged, this, [this](int v){ m_settings.sampleCount = v; onSettingsChanged(); });
     form->addRow("射线数量", samples);
-    addSlider("最大烘焙距离", 0.1f, 100, m_settings.rayDistance, [this](float v){ m_settings.rayDistance = v; });
-    addSlider("细节保留", 0, 1, m_settings.detailPreserve, [this](float v){ m_settings.detailPreserve = v; });
+    addSlider("最大烘焙距离", 0.1f, 100, m_settings.rayDistance, [this](float v){ m_settings.rayDistance = v; onSettingsChanged(); });
+    addSlider("细节保留", 0, 1, m_settings.detailPreserve, [this](float v){ m_settings.detailPreserve = v; onSettingsChanged(); });
     auto* keepSmooth = new QCheckBox("保留光滑组 / 软硬边", this);
     keepSmooth->setChecked(true);
-    connect(keepSmooth, &QCheckBox::toggled, this, [this](bool v){ m_settings.keepSmoothingGroups = v; });
+    connect(keepSmooth, &QCheckBox::toggled, this, [this](bool v){ m_settings.keepSmoothingGroups = v; onSettingsChanged(); });
     auto* keepUv = new QCheckBox("保留原始 UV 集和 UV 内容", this);
     keepUv->setChecked(true);
-    connect(keepUv, &QCheckBox::toggled, this, [this](bool v){ m_settings.keepUVs = v; });
+    connect(keepUv, &QCheckBox::toggled, this, [this](bool v){ m_settings.keepUVs = v; onSettingsChanged(); });
     auto* adaptive = new QCheckBox("自适应采样", this);
     adaptive->setChecked(true);
-    connect(adaptive, &QCheckBox::toggled, this, [this](bool v){ m_settings.adaptiveSampling = v; });
+    connect(adaptive, &QCheckBox::toggled, this, [this](bool v){ m_settings.adaptiveSampling = v; onSettingsChanged(); });
     form->addRow(keepSmooth);
     form->addRow(keepUv);
     form->addRow(adaptive);
@@ -207,6 +214,7 @@ void MainWindow::importModel() {
         m_scene = ModelIO::importModel(path);
         refreshSceneInfo();
         m_viewport->setScene(&m_scene);
+        m_viewport->setBakeSettings(m_settings);
         log("已导入模型：" + path);
     } catch (const std::exception& e) {
         QMessageBox::critical(this, "导入失败", e.what());
@@ -217,7 +225,12 @@ void MainWindow::importModel() {
 void MainWindow::refreshSceneInfo() {
     m_tree->clear();
     auto* root = new QTreeWidgetItem(QStringList() << QFileInfo(m_scene.sourcePath).fileName());
-    for (const auto& mesh : m_scene.meshes) root->addChild(new QTreeWidgetItem(QStringList() << mesh.name));
+    root->setData(0, Qt::UserRole, -1);
+    for (int i = 0; i < m_scene.meshes.size(); ++i) {
+        auto* item = new QTreeWidgetItem(QStringList() << m_scene.meshes[i].name);
+        item->setData(0, Qt::UserRole, i);
+        root->addChild(item);
+    }
     root->setExpanded(true);
     m_tree->addTopLevelItem(root);
     m_modelInfo->setText(QString("文件：%1\n顶点数：%2\n三角面：%3\nMesh：%4")
@@ -239,6 +252,7 @@ void MainWindow::chooseGroundColor() {
     if (c.isValid()) {
         m_settings.groundBounceColor = c;
         m_colorButton->setText(c.name());
+        onSettingsChanged();
     }
 }
 
@@ -286,6 +300,32 @@ void MainWindow::runBake(bool texture) {
 
 void MainWindow::bakeVertex() { runBake(false); }
 void MainWindow::bakeTexture() { runBake(true); }
+
+void MainWindow::onMeshSelected(int meshIndex, const QString& meshName) {
+    if (!m_tree) return;
+    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+        QTreeWidgetItem* root = m_tree->topLevelItem(i);
+        for (int j = 0; root && j < root->childCount(); ++j) {
+            QTreeWidgetItem* child = root->child(j);
+            if (child && child->data(0, Qt::UserRole).toInt() == meshIndex) {
+                m_tree->setCurrentItem(child);
+                log("已选择 Mesh：" + meshName);
+                return;
+            }
+        }
+    }
+    if (meshIndex < 0) {
+        m_tree->clearSelection();
+        log("已取消选择 Mesh");
+    }
+}
+
+void MainWindow::onSettingsChanged() {
+    if (m_viewport) {
+        m_viewport->setBakeSettings(m_settings);
+    }
+    statusBar()->showMessage("AO 参数已更新，视口实时预览已刷新", 1500);
+}
 
 void MainWindow::clearScene() {
     m_scene.clear();
