@@ -71,7 +71,7 @@ public:
         m_indices.resize(m_triangles.size());
         std::iota(m_indices.begin(), m_indices.end(), 0);
         if (!m_indices.isEmpty()) {
-            m_nodes.reserve(std::max(1, m_indices.size() * 2));
+            m_nodes.reserve(m_indices.size() * 2 + 1);
             buildNode(0, m_indices.size());
         }
     }
