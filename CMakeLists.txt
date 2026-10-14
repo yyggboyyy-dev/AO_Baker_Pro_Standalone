@@ -16,6 +16,7 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets Gui Core)
 find_package(assimp CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
+find_package(ZLIB REQUIRED)
 
 qt_add_executable(AO_Baker_Pro_Standalone WIN32
     src/main.cpp
@@ -40,6 +41,7 @@ target_link_libraries(AO_Baker_Pro_Standalone PRIVATE
     Qt6::Core
     assimp::assimp
     glm::glm
+    ZLIB::ZLIB
 )
 
 target_compile_definitions(AO_Baker_Pro_Standalone PRIVATE
