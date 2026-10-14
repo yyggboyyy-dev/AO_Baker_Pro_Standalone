@@ -41,7 +41,9 @@ private slots:
     void chooseOutputDir();
     void chooseGroundColor();
     void chooseMaterialColor();
+    void choosePaintColor();
     void repairFaceOrientation();
+    void unifySmoothingGroups();
     void bakeVertex();
     void bakeTexture();
     void clearScene();
@@ -50,8 +52,10 @@ private slots:
 
 private:
     void buildUi();
+    void buildMenus();
     QWidget* group(const QString& title, QWidget* child);
     QWidget* buildSettingsPanel();
+    QWidget* buildVertexPaintPanel();
     QWidget* buildOutputPanel();
     void applyStyle();
     void refreshSceneInfo();
@@ -72,6 +76,8 @@ private:
     QLabel* m_outputLabel = nullptr;
     QPushButton* m_colorButton = nullptr;
     QPushButton* m_materialColorButton = nullptr;
+    QPushButton* m_paintColorButton = nullptr;
+    QLineEdit* m_outputNameEdit = nullptr;
     QComboBox* m_resolution = nullptr;
     QComboBox* m_format = nullptr;
 };

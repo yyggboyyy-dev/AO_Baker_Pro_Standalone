@@ -11,12 +11,25 @@ class ViewportWidget : public QOpenGLWidget {
 public:
     explicit ViewportWidget(QWidget* parent = nullptr);
 
-    void setScene(const SceneData* scene);
+    void setScene(SceneData* scene);
     void setBakeSettings(const BakeSettings& settings);
     void setRealtimePreviewEnabled(bool enabled);
+    void setCameraView(const QString& viewName);
+    void focusModel();
     void setWireframeVisible(bool visible);
     void setDefaultMaterialColor(const QColor& color);
     void setUseVertexColor(bool enabled);
+    void setVertexPaintEnabled(bool enabled);
+    void setPaintEraseMode(bool enabled);
+    void setPaintMode(int mode);
+    void setPaintBlendMode(const QString& mode);
+    void setPaintColor(const QColor& color);
+    void setPaintOpacity(float opacity);
+    void setPaintRadius(float radius);
+    void setPaintSoftBrush(bool enabled);
+    void setLayerOpacity(float opacity);
+    void setVisibleChannels(bool red, bool green, bool blue);
+    void fillSelectedMesh();
     void setSelectedMesh(int meshIndex);
     int selectedMesh() const { return m_selectedMesh; }
 
@@ -49,12 +62,24 @@ private:
         QColor color;
     };
 
-    const SceneData* m_scene = nullptr;
+    SceneData* m_scene = nullptr;
     BakeSettings m_settings;
     bool m_realtimePreview = true;
     bool m_wireframeVisible = true;
     bool m_useVertexColor = true;
+    bool m_vertexPaintEnabled = false;
+    bool m_paintEraseMode = false;
+    bool m_paintSoftBrush = true;
+    int m_paintMode = 0;
+    bool m_showRedChannel = true;
+    bool m_showGreenChannel = true;
+    bool m_showBlueChannel = true;
+    float m_paintOpacity = 1.0f;
+    float m_paintRadius = 24.0f;
+    float m_layerOpacity = 1.0f;
     QColor m_defaultMaterialColor = QColor(188, 198, 210);
+    QColor m_paintColor = QColor(255, 255, 255);
+    QString m_paintBlendMode = QStringLiteral("正常");
     int m_selectedMesh = -1;
 
     float m_yaw = -35.0f;
@@ -78,5 +103,8 @@ private:
     void drawGrid(QPainter& p) const;
     void drawOverlay(QPainter& p) const;
     int pickMeshAt(const QPoint& pos) const;
+    void paintVertexAt(const QPoint& pos);
+    QColor channelFilteredColor(const QColor& color) const;
+    QColor blendPaintColor(const QColor& base, const QColor& paint, float alpha) const;
     static bool pointInTriangle(const QPointF& p, const QPointF& a, const QPointF& b, const QPointF& c);
 };

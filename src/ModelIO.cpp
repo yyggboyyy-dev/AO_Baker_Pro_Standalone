@@ -6,14 +6,25 @@
 #include <assimp/postprocess.h>
 #include <QFileInfo>
 #include <QVector4D>
+#include <QFile>
+#include <QByteArray>
+#include <QStringList>
 #include <stdexcept>
 #include <memory>
 
 static QVector3D toVec3(const aiVector3D& v) { return QVector3D(v.x, v.y, v.z); }
 static QVector2D toVec2(const aiVector3D& v) { return QVector2D(v.x, v.y); }
 
-SceneData ModelIO::importModel(const QString& filePath) {
-    Assimp::Importer importer;
+static int detectFbxVersion(const QString& filePath) {
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) return 0;
+    const QByteArray head = file.read(32);
+    if (!head.startsWith("Kaydara FBX Binary") || head.size() < 27) return 0;
+    const uchar* p = reinterpret_cast<const uchar*>(head.constData() + 23);
+    return int(p[0]) | (int(p[1]) << 8) | (int(p[2]) << 16) | (int(p[3]) << 24);
+}
+
+static void setupFbxImporter(Assimp::Importer& importer) {
     importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_PRESERVE_PIVOTS, true);
     importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_ALL_GEOMETRY_LAYERS, true);
     importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_ALL_MATERIALS, true);
@@ -22,18 +33,88 @@ SceneData ModelIO::importModel(const QString& filePath) {
     importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_CAMERAS, false);
     importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_READ_LIGHTS, false);
     importer.SetPropertyBool(AI_CONFIG_IMPORT_FBX_STRICT_MODE, false);
+    importer.SetPropertyInteger(AI_CONFIG_PP_SBP_REMOVE, 0);
+}
 
-    const unsigned int flags =
+static void computeMissingNormals(MeshData& mesh) {
+    bool needsNormals = !mesh.hasNormals;
+    if (!needsNormals) {
+        for (const auto& v : mesh.vertices) {
+            if (v.normal.lengthSquared() < 1e-8f) {
+                needsNormals = true;
+                break;
+            }
+        }
+    }
+    if (!needsNormals) return;
+
+    for (auto& vertex : mesh.vertices) vertex.normal = QVector3D(0, 0, 0);
+    for (const auto& face : mesh.faces) {
+        if (face.i0 < 0 || face.i1 < 0 || face.i2 < 0 ||
+            face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size()) {
+            continue;
+        }
+        const QVector3D a = mesh.vertices[face.i0].position;
+        const QVector3D b = mesh.vertices[face.i1].position;
+        const QVector3D c = mesh.vertices[face.i2].position;
+        const QVector3D n = QVector3D::crossProduct(b - a, c - a);
+        mesh.vertices[face.i0].normal += n;
+        mesh.vertices[face.i1].normal += n;
+        mesh.vertices[face.i2].normal += n;
+    }
+    for (auto& vertex : mesh.vertices) {
+        vertex.normal = vertex.normal.lengthSquared() > 1e-8f ? vertex.normal.normalized() : QVector3D(0, 0, 1);
+    }
+    mesh.hasNormals = true;
+}
+
+SceneData ModelIO::importModel(const QString& filePath) {
+    const bool isFbx = QFileInfo(filePath).suffix().toLower() == "fbx";
+    const int fbxVersion = isFbx ? detectFbxVersion(filePath) : 0;
+
+    const unsigned int preserveFlags =
         aiProcess_Triangulate |
-        aiProcess_JoinIdenticalVertices |
         aiProcess_SortByPType |
-        aiProcess_ImproveCacheLocality |
-        aiProcess_ValidateDataStructure |
-        aiProcess_OptimizeMeshes;
+        aiProcess_ImproveCacheLocality;
 
-    const aiScene* ai = importer.ReadFile(filePath.toStdString(), flags);
+    const unsigned int safeFlags =
+        aiProcess_Triangulate |
+        aiProcess_SortByPType;
+
+    const unsigned int fallbackFlags =
+        aiProcess_Triangulate;
+
+    const unsigned int normalFallbackFlags =
+        aiProcess_Triangulate |
+        aiProcess_GenSmoothNormals |
+        aiProcess_SortByPType;
+
+    const unsigned int attempts[] = { preserveFlags, safeFlags, fallbackFlags, normalFallbackFlags };
+    QStringList errors;
+    const aiScene* ai = nullptr;
+    std::unique_ptr<Assimp::Importer> activeImporter;
+
+    for (unsigned int flags : attempts) {
+        auto importer = std::make_unique<Assimp::Importer>();
+        setupFbxImporter(*importer);
+        if (isFbx && (fbxVersion == 7400 || fbxVersion == 7500)) {
+            importer->SetPropertyBool(AI_CONFIG_IMPORT_FBX_STRICT_MODE, false);
+        }
+
+        ai = importer->ReadFile(filePath.toStdString(), flags);
+        if (ai && ai->HasMeshes()) {
+            activeImporter = std::move(importer);
+            break;
+        }
+        errors << QString::fromUtf8(importer->GetErrorString());
+    }
+
     if (!ai || !ai->HasMeshes()) {
-        throw std::runtime_error(QString("模型导入失败：%1").arg(importer.GetErrorString()).toStdString());
+        QString versionInfo;
+        if (isFbx && fbxVersion > 0) {
+            versionInfo = QString("\n检测到 FBX 版本：%1。已按 Autodesk FBX 2014/2015 兼容路径尝试导入。").arg(fbxVersion);
+        }
+        throw std::runtime_error(QString("模型导入失败：%1%2").arg(errors.join(" | ")).arg(versionInfo).toStdString());
     }
 
     SceneData scene;
@@ -71,9 +152,10 @@ SceneData ModelIO::importModel(const QString& filePath) {
             face.i1 = static_cast<int>(f.mIndices[1]);
             face.i2 = static_cast<int>(f.mIndices[2]);
             face.materialIndex = static_cast<int>(src->mMaterialIndex);
-            if (src->mFaces[fi].mNumIndices >= 3) face.smoothingMask = 0xffffffffu;
+            face.smoothingMask = 0xffffffffu;
             mesh.faces.push_back(face);
         }
+        computeMissingNormals(mesh);
         scene.meshes.push_back(mesh);
     }
     return scene;

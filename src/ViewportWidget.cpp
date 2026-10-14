@@ -20,7 +20,7 @@ ViewportWidget::ViewportWidget(QWidget* parent) : QOpenGLWidget(parent) {
     setFocusPolicy(Qt::StrongFocus);
 }
 
-void ViewportWidget::setScene(const SceneData* scene) {
+void ViewportWidget::setScene(SceneData* scene) {
     m_scene = scene;
     m_selectedMesh = -1;
     updateBounds();
@@ -38,6 +38,39 @@ void ViewportWidget::setRealtimePreviewEnabled(bool enabled) {
     update();
 }
 
+void ViewportWidget::setCameraView(const QString& viewName) {
+    if (viewName == QStringLiteral("透视图")) {
+        m_yaw = -35.0f;
+        m_pitch = 22.0f;
+    } else if (viewName == QStringLiteral("正面正交视图")) {
+        m_yaw = 0.0f;
+        m_pitch = 0.0f;
+    } else if (viewName == QStringLiteral("左侧视图")) {
+        m_yaw = -90.0f;
+        m_pitch = 0.0f;
+    } else if (viewName == QStringLiteral("右侧视图")) {
+        m_yaw = 90.0f;
+        m_pitch = 0.0f;
+    } else if (viewName == QStringLiteral("背后视图")) {
+        m_yaw = 180.0f;
+        m_pitch = 0.0f;
+    } else if (viewName == QStringLiteral("顶部视图")) {
+        m_yaw = 0.0f;
+        m_pitch = 89.0f;
+    } else if (viewName == QStringLiteral("底部视图")) {
+        m_yaw = 0.0f;
+        m_pitch = -89.0f;
+    }
+    m_pan = QPointF(0.0, 0.0);
+    update();
+}
+
+void ViewportWidget::focusModel() {
+    updateBounds();
+    resetCamera();
+    update();
+}
+
 void ViewportWidget::setWireframeVisible(bool visible) {
     m_wireframeVisible = visible;
     update();
@@ -50,6 +83,51 @@ void ViewportWidget::setDefaultMaterialColor(const QColor& color) {
 
 void ViewportWidget::setUseVertexColor(bool enabled) {
     m_useVertexColor = enabled;
+    update();
+}
+
+void ViewportWidget::setVertexPaintEnabled(bool enabled) {
+    m_vertexPaintEnabled = enabled;
+    update();
+}
+
+void ViewportWidget::setPaintEraseMode(bool enabled) {
+    m_paintEraseMode = enabled;
+}
+
+void ViewportWidget::setPaintMode(int mode) {
+    m_paintMode = mode;
+}
+
+void ViewportWidget::setPaintBlendMode(const QString& mode) {
+    m_paintBlendMode = mode;
+}
+
+void ViewportWidget::setPaintColor(const QColor& color) {
+    m_paintColor = color;
+}
+
+void ViewportWidget::setPaintOpacity(float opacity) {
+    m_paintOpacity = std::clamp(opacity, 0.0f, 1.0f);
+}
+
+void ViewportWidget::setPaintRadius(float radius) {
+    m_paintRadius = std::clamp(radius, 1.0f, 300.0f);
+}
+
+void ViewportWidget::setPaintSoftBrush(bool enabled) {
+    m_paintSoftBrush = enabled;
+}
+
+void ViewportWidget::setLayerOpacity(float opacity) {
+    m_layerOpacity = std::clamp(opacity, 0.0f, 1.0f);
+    update();
+}
+
+void ViewportWidget::setVisibleChannels(bool red, bool green, bool blue) {
+    m_showRedChannel = red;
+    m_showGreenChannel = green;
+    m_showBlueChannel = blue;
     update();
 }
 
@@ -127,8 +205,26 @@ ViewportWidget::ProjectedVertex ViewportWidget::projectVertex(const QVector3D& w
     return {screen, z, cam};
 }
 
+QColor ViewportWidget::channelFilteredColor(const QColor& color) const {
+    return QColor(
+        m_showRedChannel ? color.red() : 0,
+        m_showGreenChannel ? color.green() : 0,
+        m_showBlueChannel ? color.blue() : 0,
+        color.alpha()
+    );
+}
+
 QColor ViewportWidget::previewColor(const MeshData& mesh, const Vertex& v, int meshIndex) const {
     QColor base = (m_useVertexColor && mesh.hasVertexColor) ? v.color : m_defaultMaterialColor;
+    base = channelFilteredColor(base);
+    if (m_useVertexColor && mesh.hasVertexColor) {
+        base = QColor(
+            int(base.red() * m_layerOpacity + m_defaultMaterialColor.red() * (1.0f - m_layerOpacity)),
+            int(base.green() * m_layerOpacity + m_defaultMaterialColor.green() * (1.0f - m_layerOpacity)),
+            int(base.blue() * m_layerOpacity + m_defaultMaterialColor.blue() * (1.0f - m_layerOpacity)),
+            255
+        );
+    }
 
     if (m_realtimePreview) {
         QVector3D n = v.normal.lengthSquared() > 0.00001f ? v.normal.normalized() : QVector3D(0, 1, 0);
@@ -191,11 +287,14 @@ void ViewportWidget::drawOverlay(QPainter& p) const {
         .arg(m_scene ? m_scene->faceCount() : 0)
         .arg(selected));
     p.drawText(14, height() - 42, "Maya 操作：Alt+左键旋转 / Alt+中键平移 / Alt+右键缩放 / 滚轮缩放 / F 重置视图 / 鼠标左键点选模型");
-    p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    显示顶点色：%3    材质色：%4")
+    p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    顶点色：%3    绘制：%4    RGB：%5%6%7")
         .arg(m_realtimePreview ? "开启" : "关闭")
         .arg(m_wireframeVisible ? "开启" : "关闭")
         .arg(m_useVertexColor ? "开启" : "关闭")
-        .arg(m_defaultMaterialColor.name()));
+        .arg(m_vertexPaintEnabled ? (m_paintEraseMode ? "擦除" : "画笔") : "关闭")
+        .arg(m_showRedChannel ? "R" : "-")
+        .arg(m_showGreenChannel ? "G" : "-")
+        .arg(m_showBlueChannel ? "B" : "-"));
     p.restore();
 }
 
@@ -257,12 +356,113 @@ void ViewportWidget::paintGL() {
     drawOverlay(p);
 }
 
+QColor ViewportWidget::blendPaintColor(const QColor& base, const QColor& paint, float alpha) const {
+    alpha = std::clamp(alpha, 0.0f, 1.0f);
+    if (m_paintBlendMode == QStringLiteral("正片叠底") || m_paintBlendMode == QStringLiteral("相乘")) {
+        return QColor(
+            std::clamp(int(base.red() * (1.0f - alpha) + (base.red() * paint.red() / 255) * alpha), 0, 255),
+            std::clamp(int(base.green() * (1.0f - alpha) + (base.green() * paint.green() / 255) * alpha), 0, 255),
+            std::clamp(int(base.blue() * (1.0f - alpha) + (base.blue() * paint.blue() / 255) * alpha), 0, 255),
+            255
+        );
+    }
+    if (m_paintBlendMode == QStringLiteral("滤色")) {
+        return QColor(
+            std::clamp(int(base.red() * (1.0f - alpha) + (255 - (255 - base.red()) * (255 - paint.red()) / 255) * alpha), 0, 255),
+            std::clamp(int(base.green() * (1.0f - alpha) + (255 - (255 - base.green()) * (255 - paint.green()) / 255) * alpha), 0, 255),
+            std::clamp(int(base.blue() * (1.0f - alpha) + (255 - (255 - base.blue()) * (255 - paint.blue()) / 255) * alpha), 0, 255),
+            255
+        );
+    }
+    if (m_paintBlendMode == QStringLiteral("叠加") || m_paintBlendMode == QStringLiteral("加亮")) {
+        return QColor(
+            std::clamp(int(base.red() * (1.0f - alpha) + std::min(255, base.red() + paint.red()) * alpha), 0, 255),
+            std::clamp(int(base.green() * (1.0f - alpha) + std::min(255, base.green() + paint.green()) * alpha), 0, 255),
+            std::clamp(int(base.blue() * (1.0f - alpha) + std::min(255, base.blue() + paint.blue()) * alpha), 0, 255),
+            255
+        );
+    }
+    if (m_paintBlendMode == QStringLiteral("变暗")) {
+        return QColor(
+            std::clamp(int(base.red() * (1.0f - alpha) + std::min(base.red(), paint.red()) * alpha), 0, 255),
+            std::clamp(int(base.green() * (1.0f - alpha) + std::min(base.green(), paint.green()) * alpha), 0, 255),
+            std::clamp(int(base.blue() * (1.0f - alpha) + std::min(base.blue(), paint.blue()) * alpha), 0, 255),
+            255
+        );
+    }
+    return QColor(
+        std::clamp(int(base.red() * (1.0f - alpha) + paint.red() * alpha), 0, 255),
+        std::clamp(int(base.green() * (1.0f - alpha) + paint.green() * alpha), 0, 255),
+        std::clamp(int(base.blue() * (1.0f - alpha) + paint.blue() * alpha), 0, 255),
+        255
+    );
+}
+
+void ViewportWidget::paintVertexAt(const QPoint& pos) {
+    if (!m_vertexPaintEnabled || !m_scene || m_scene->empty()) return;
+
+    if (m_paintMode == 2) {
+        fillSelectedMesh();
+        return;
+    }
+
+    const int targetMesh = m_selectedMesh;
+    bool changed = false;
+    const QColor target = m_paintEraseMode ? QColor(255, 255, 255) : m_paintColor;
+
+    for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
+        if (targetMesh >= 0 && meshIndex != targetMesh) continue;
+        auto& mesh = m_scene->meshes[meshIndex];
+        for (auto& vertex : mesh.vertices) {
+            const auto pv = projectVertex(vertex.position);
+            if (pv.camera.z() > -0.02f) continue;
+            const float dist = float(std::hypot(pv.screen.x() - pos.x(), pv.screen.y() - pos.y()));
+            if (dist > m_paintRadius) continue;
+
+            float falloff = 1.0f;
+            if (m_paintSoftBrush) {
+                const float t = std::clamp(dist / std::max(1.0f, m_paintRadius), 0.0f, 1.0f);
+                falloff = 1.0f - t * t * (3.0f - 2.0f * t);
+            }
+            const float alpha = std::clamp(m_paintOpacity * falloff, 0.0f, 1.0f);
+            QColor src = vertex.color;
+            vertex.color = blendPaintColor(src, target, alpha);
+            changed = true;
+        }
+        if (changed) mesh.hasVertexColor = true;
+    }
+
+    if (changed) {
+        m_useVertexColor = true;
+        update();
+    }
+}
+
+void ViewportWidget::fillSelectedMesh() {
+    if (!m_scene || m_scene->empty()) return;
+    const int targetMesh = m_selectedMesh;
+    for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
+        if (targetMesh >= 0 && meshIndex != targetMesh) continue;
+        auto& mesh = m_scene->meshes[meshIndex];
+        for (auto& vertex : mesh.vertices) {
+            vertex.color = blendPaintColor(vertex.color, m_paintColor, m_paintOpacity);
+        }
+        mesh.hasVertexColor = true;
+    }
+    m_useVertexColor = true;
+    update();
+}
+
 void ViewportWidget::mousePressEvent(QMouseEvent* event) {
     setFocus();
     m_lastMousePos = event->pos();
     m_pressMousePos = event->pos();
     m_activeButton = event->button();
     m_dragged = false;
+    if (m_vertexPaintEnabled && event->button() == Qt::LeftButton && !(event->modifiers() & Qt::AltModifier)) {
+        paintVertexAt(event->pos());
+        m_dragged = true;
+    }
     event->accept();
 }
 
@@ -273,6 +473,12 @@ void ViewportWidget::mouseMoveEvent(QMouseEvent* event) {
     }
 
     const bool mayaNav = event->modifiers() & Qt::AltModifier;
+    if (m_vertexPaintEnabled && (event->buttons() & Qt::LeftButton) && !mayaNav) {
+        paintVertexAt(event->pos());
+        m_lastMousePos = event->pos();
+        event->accept();
+        return;
+    }
     if (mayaNav && (event->buttons() & Qt::LeftButton)) {
         m_yaw += delta.x() * 0.45f;
         m_pitch += delta.y() * 0.45f;

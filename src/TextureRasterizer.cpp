@@ -1,11 +1,70 @@
 #include "TextureRasterizer.h"
 #include <QImage>
+#include <QFile>
 #include <QtMath>
 #include <algorithm>
 #include <stdexcept>
 
 static float edge(const QPointF& a, const QPointF& b, const QPointF& c) {
     return float((c.x() - a.x()) * (b.y() - a.y()) - (c.y() - a.y()) * (b.x() - a.x()));
+}
+
+static bool saveTgaRgb24(const QImage& src, const QString& filePath) {
+    QImage img = src.convertToFormat(QImage::Format_RGB888);
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+
+    unsigned char header[18] = {};
+    header[2] = 2;
+    header[12] = static_cast<unsigned char>(img.width() & 0xff);
+    header[13] = static_cast<unsigned char>((img.width() >> 8) & 0xff);
+    header[14] = static_cast<unsigned char>(img.height() & 0xff);
+    header[15] = static_cast<unsigned char>((img.height() >> 8) & 0xff);
+    header[16] = 24;
+    header[17] = 0x20;
+    if (file.write(reinterpret_cast<const char*>(header), 18) != 18) return false;
+
+    QByteArray row;
+    row.resize(img.width() * 3);
+    for (int y = 0; y < img.height(); ++y) {
+        const uchar* line = img.constScanLine(y);
+        for (int x = 0; x < img.width(); ++x) {
+            row[x * 3 + 0] = static_cast<char>(line[x * 3 + 2]);
+            row[x * 3 + 1] = static_cast<char>(line[x * 3 + 1]);
+            row[x * 3 + 2] = static_cast<char>(line[x * 3 + 0]);
+        }
+        if (file.write(row) != row.size()) return false;
+    }
+    return true;
+}
+
+static bool saveTga(const QImage& image, const QString& filePath) {
+    QImage src = image.convertToFormat(QImage::Format_RGB888);
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+
+    unsigned char header[18] = {};
+    header[2] = 2;
+    header[12] = static_cast<unsigned char>(src.width() & 0xFF);
+    header[13] = static_cast<unsigned char>((src.width() >> 8) & 0xFF);
+    header[14] = static_cast<unsigned char>(src.height() & 0xFF);
+    header[15] = static_cast<unsigned char>((src.height() >> 8) & 0xFF);
+    header[16] = 24;
+    header[17] = 0x20;
+    if (file.write(reinterpret_cast<const char*>(header), 18) != 18) return false;
+
+    for (int y = 0; y < src.height(); ++y) {
+        for (int x = 0; x < src.width(); ++x) {
+            const QColor c = src.pixelColor(x, y);
+            unsigned char bgr[3] = {
+                static_cast<unsigned char>(c.blue()),
+                static_cast<unsigned char>(c.green()),
+                static_cast<unsigned char>(c.red())
+            };
+            if (file.write(reinterpret_cast<const char*>(bgr), 3) != 3) return false;
+        }
+    }
+    return true;
 }
 
 void TextureRasterizer::bakeAOTexture(const SceneData& scene, const QString& filePath, const BakeSettings& settings) {
@@ -80,7 +139,16 @@ void TextureRasterizer::bakeAOTexture(const SceneData& scene, const QString& fil
         mask = nextMask;
     }
 
-    if (!img.save(filePath, settings.textureFormat.toUtf8().constData())) {
-        throw std::runtime_error("AO 贴图保存失败。请选择 PNG / JPG / BMP 等 Qt 支持格式。无插件静态包建议使用 PNG。 ");
+    const QString fmt = settings.textureFormat.toUpper();
+    bool saved = false;
+    if (fmt == "TGA") {
+        saved = saveTga(img, filePath);
+    } else if (fmt == "JPG") {
+        saved = img.save(filePath, "JPG");
+    } else {
+        saved = img.save(filePath, fmt.toUtf8().constData());
+    }
+    if (!saved) {
+        throw std::runtime_error("AO 贴图保存失败。当前支持 TGA / PNG / JPG / BMP，请检查输出目录权限和文件名。");
     }
 }
