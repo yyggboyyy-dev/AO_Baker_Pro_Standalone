@@ -12,6 +12,7 @@
     },
     "assimp",
     "glm",
-    "stb"
+    "stb",
+    "zlib"
   ]
 }
