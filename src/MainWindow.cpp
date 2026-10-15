@@ -1530,7 +1530,7 @@ void MainWindow::updateRecentFilesMenu() {
         emptyAction->setEnabled(false);
         return;
     }
-    const int count = std::min(10, m_recentFiles.size());
+    const int count = std::min(10, static_cast<int>(m_recentFiles.size()));
     for (int i = 0; i < count; ++i) {
         const QString path = m_recentFiles[i];
         auto* act = m_recentFilesMenu->addAction(path, this, &MainWindow::importRecentModel);
