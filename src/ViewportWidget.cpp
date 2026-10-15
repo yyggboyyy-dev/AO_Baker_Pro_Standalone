@@ -1,5 +1,6 @@
 #include "ViewportWidget.h"
 
+#include <QJsonObject>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
@@ -12,6 +13,9 @@ namespace {
 constexpr float kPi = 3.14159265358979323846f;
 float degToRad(float degrees) { return degrees * kPi / 180.0f; }
 float clamp01(float v) { return std::max(0.0f, std::min(1.0f, v)); }
+quint64 changeKey(int meshIndex, int vertexIndex) {
+    return (quint64(quint32(meshIndex)) << 32) | quint32(vertexIndex);
+}
 }
 
 ViewportWidget::ViewportWidget(QWidget* parent) : QOpenGLWidget(parent) {
@@ -23,6 +27,12 @@ ViewportWidget::ViewportWidget(QWidget* parent) : QOpenGLWidget(parent) {
 void ViewportWidget::setScene(SceneData* scene) {
     m_scene = scene;
     m_selectedMesh = -1;
+    m_undoStack.clear();
+    m_redoStack.clear();
+    m_pendingStroke.clear();
+    m_pendingStrokeIndex.clear();
+    m_strokeActive = false;
+    emit undoAvailabilityChanged(canUndo(), canRedo());
     updateBounds();
     resetCamera();
     update();
@@ -131,8 +141,63 @@ void ViewportWidget::setVisibleChannels(bool red, bool green, bool blue) {
     update();
 }
 
+void ViewportWidget::setIgnoreBackfaces(bool enabled) {
+    m_ignoreBackfaces = enabled;
+}
+
+void ViewportWidget::setLockedChannels(bool lockRed, bool lockGreen, bool lockBlue) {
+    m_lockRed = lockRed;
+    m_lockGreen = lockGreen;
+    m_lockBlue = lockBlue;
+}
+
 void ViewportWidget::setSelectedMesh(int meshIndex) {
     m_selectedMesh = meshIndex;
+    update();
+}
+
+void ViewportWidget::undo() {
+    if (!m_scene || m_undoStack.isEmpty()) return;
+    const QVector<ColorChange> step = m_undoStack.takeLast();
+    applyColorChanges(step, false);
+    m_redoStack.push_back(step);
+    emit undoAvailabilityChanged(canUndo(), canRedo());
+    emit sceneModified();
+}
+
+void ViewportWidget::redo() {
+    if (!m_scene || m_redoStack.isEmpty()) return;
+    const QVector<ColorChange> step = m_redoStack.takeLast();
+    applyColorChanges(step, true);
+    m_undoStack.push_back(step);
+    emit undoAvailabilityChanged(canUndo(), canRedo());
+    emit sceneModified();
+}
+
+QJsonObject ViewportWidget::saveViewState() const {
+    QJsonObject obj;
+    obj["yaw"] = m_yaw;
+    obj["pitch"] = m_pitch;
+    obj["distance"] = m_distance;
+    obj["zoom"] = m_zoom;
+    obj["panX"] = m_pan.x();
+    obj["panY"] = m_pan.y();
+    obj["wireframe"] = m_wireframeVisible;
+    obj["useVertexColor"] = m_useVertexColor;
+    obj["selectedMesh"] = m_selectedMesh;
+    return obj;
+}
+
+void ViewportWidget::restoreViewState(const QJsonObject& state) {
+    m_yaw = float(state.value("yaw").toDouble(m_yaw));
+    m_pitch = float(state.value("pitch").toDouble(m_pitch));
+    m_distance = float(state.value("distance").toDouble(m_distance));
+    m_zoom = float(state.value("zoom").toDouble(m_zoom));
+    m_pan.setX(state.value("panX").toDouble(m_pan.x()));
+    m_pan.setY(state.value("panY").toDouble(m_pan.y()));
+    m_wireframeVisible = state.value("wireframe").toBool(m_wireframeVisible);
+    m_useVertexColor = state.value("useVertexColor").toBool(m_useVertexColor);
+    m_selectedMesh = state.value("selectedMesh").toInt(m_selectedMesh);
     update();
 }
 
@@ -192,6 +257,18 @@ QVector3D ViewportWidget::rotateToCamera(const QVector3D& world) const {
     QVector3D cam(yRot.x(), yRot.y() * cp - yRot.z() * sp, yRot.y() * sp + yRot.z() * cp);
     cam.setZ(cam.z() - m_distance);
     return cam;
+}
+
+QVector3D ViewportWidget::rotateDirectionToCamera(const QVector3D& dir) const {
+    const float yaw = degToRad(m_yaw);
+    const float cy = std::cos(yaw);
+    const float sy = std::sin(yaw);
+    QVector3D yRot(dir.x() * cy + dir.z() * sy, dir.y(), -dir.x() * sy + dir.z() * cy);
+
+    const float pitch = degToRad(m_pitch);
+    const float cp = std::cos(pitch);
+    const float sp = std::sin(pitch);
+    return QVector3D(yRot.x(), yRot.y() * cp - yRot.z() * sp, yRot.y() * sp + yRot.z() * cp);
 }
 
 ViewportWidget::ProjectedVertex ViewportWidget::projectVertex(const QVector3D& world) const {
@@ -287,14 +364,15 @@ void ViewportWidget::drawOverlay(QPainter& p) const {
         .arg(m_scene ? m_scene->faceCount() : 0)
         .arg(selected));
     p.drawText(14, height() - 42, "Maya 操作：Alt+左键旋转 / Alt+中键平移 / Alt+右键缩放 / 滚轮缩放 / F 重置视图 / 鼠标左键点选模型");
-    p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    顶点色：%3    绘制：%4    RGB：%5%6%7")
+    p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    顶点色：%3    绘制：%4    RGB：%5%6%7    背面忽略：%8")
         .arg(m_realtimePreview ? "开启" : "关闭")
         .arg(m_wireframeVisible ? "开启" : "关闭")
         .arg(m_useVertexColor ? "开启" : "关闭")
-        .arg(m_vertexPaintEnabled ? (m_paintEraseMode ? "擦除" : "画笔") : "关闭")
+        .arg(m_vertexPaintEnabled ? (m_paintEraseMode ? "擦除" : (m_paintMode == 2 ? "填充" : "画笔")) : "关闭")
         .arg(m_showRedChannel ? "R" : "-")
         .arg(m_showGreenChannel ? "G" : "-")
-        .arg(m_showBlueChannel ? "B" : "-"));
+        .arg(m_showBlueChannel ? "B" : "-")
+        .arg(m_ignoreBackfaces ? "开启" : "关闭"));
     p.restore();
 }
 
@@ -398,6 +476,100 @@ QColor ViewportWidget::blendPaintColor(const QColor& base, const QColor& paint, 
     );
 }
 
+QColor ViewportWidget::applyLockedChannels(const QColor& base, const QColor& painted) const {
+    return QColor(
+        m_lockRed ? base.red() : painted.red(),
+        m_lockGreen ? base.green() : painted.green(),
+        m_lockBlue ? base.blue() : painted.blue(),
+        painted.alpha()
+    );
+}
+
+bool ViewportWidget::isVertexPaintable(const Vertex& vertex) const {
+    if (!m_ignoreBackfaces) return true;
+    QVector3D n = vertex.normal.lengthSquared() > 0.00001f ? vertex.normal.normalized() : QVector3D(0, 0, 1);
+    const QVector3D camN = rotateDirectionToCamera(n);
+    return camN.z() < 0.0f;
+}
+
+void ViewportWidget::beginStroke() {
+    if (m_strokeActive) return;
+    m_pendingStroke.clear();
+    m_pendingStrokeIndex.clear();
+    m_strokeActive = true;
+}
+
+void ViewportWidget::recordColorChange(int meshIndex, int vertexIndex, const QColor& oldColor, const QColor& newColor) {
+    if (oldColor == newColor) return;
+    const quint64 key = changeKey(meshIndex, vertexIndex);
+    const auto it = m_pendingStrokeIndex.constFind(key);
+    if (it != m_pendingStrokeIndex.constEnd()) {
+        m_pendingStroke[it.value()].newColor = newColor;
+        return;
+    }
+    ColorChange change;
+    change.meshIndex = meshIndex;
+    change.vertexIndex = vertexIndex;
+    change.oldColor = oldColor;
+    change.newColor = newColor;
+    m_pendingStrokeIndex.insert(key, m_pendingStroke.size());
+    m_pendingStroke.push_back(change);
+}
+
+void ViewportWidget::commitPendingStroke() {
+    if (!m_strokeActive) return;
+    m_strokeActive = false;
+    if (m_pendingStroke.isEmpty()) {
+        m_pendingStrokeIndex.clear();
+        return;
+    }
+    pushUndoStep(m_pendingStroke);
+    m_pendingStroke.clear();
+    m_pendingStrokeIndex.clear();
+    emit sceneModified();
+}
+
+void ViewportWidget::pushUndoStep(const QVector<ColorChange>& changes) {
+    if (changes.isEmpty()) return;
+    m_undoStack.push_back(changes);
+    m_redoStack.clear();
+    emit undoAvailabilityChanged(canUndo(), canRedo());
+}
+
+void ViewportWidget::refreshMeshColorFlags(const QVector<int>& meshIndices) {
+    if (!m_scene) return;
+    for (const int meshIndex : meshIndices) {
+        if (meshIndex < 0 || meshIndex >= m_scene->meshes.size()) continue;
+        auto& mesh = m_scene->meshes[meshIndex];
+        bool hasAnyNonWhite = false;
+        for (const auto& vertex : mesh.vertices) {
+            if (vertex.color != QColor(255, 255, 255, 255)) {
+                hasAnyNonWhite = true;
+                break;
+            }
+        }
+        mesh.hasVertexColor = hasAnyNonWhite;
+    }
+    update();
+}
+
+void ViewportWidget::applyColorChanges(const QVector<ColorChange>& changes, bool useNewColor) {
+    if (!m_scene) return;
+    QVector<int> touchedMeshes;
+    touchedMeshes.reserve(changes.size());
+    for (const auto& change : changes) {
+        if (change.meshIndex < 0 || change.meshIndex >= m_scene->meshes.size()) continue;
+        auto& mesh = m_scene->meshes[change.meshIndex];
+        if (change.vertexIndex < 0 || change.vertexIndex >= mesh.vertices.size()) continue;
+        mesh.vertices[change.vertexIndex].color = useNewColor ? change.newColor : change.oldColor;
+        if (!touchedMeshes.contains(change.meshIndex)) {
+            touchedMeshes.push_back(change.meshIndex);
+        }
+    }
+    refreshMeshColorFlags(touchedMeshes);
+    m_useVertexColor = true;
+}
+
 void ViewportWidget::paintVertexAt(const QPoint& pos) {
     if (!m_vertexPaintEnabled || !m_scene || m_scene->empty()) return;
 
@@ -406,6 +578,7 @@ void ViewportWidget::paintVertexAt(const QPoint& pos) {
         return;
     }
 
+    beginStroke();
     const int targetMesh = m_selectedMesh;
     bool changed = false;
     const QColor target = m_paintEraseMode ? QColor(255, 255, 255) : m_paintColor;
@@ -413,9 +586,12 @@ void ViewportWidget::paintVertexAt(const QPoint& pos) {
     for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
         if (targetMesh >= 0 && meshIndex != targetMesh) continue;
         auto& mesh = m_scene->meshes[meshIndex];
-        for (auto& vertex : mesh.vertices) {
+        bool meshChanged = false;
+        for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
+            auto& vertex = mesh.vertices[vertexIndex];
             const auto pv = projectVertex(vertex.position);
             if (pv.camera.z() > -0.02f) continue;
+            if (!isVertexPaintable(vertex)) continue;
             const float dist = float(std::hypot(pv.screen.x() - pos.x(), pv.screen.y() - pos.y()));
             if (dist > m_paintRadius) continue;
 
@@ -425,11 +601,16 @@ void ViewportWidget::paintVertexAt(const QPoint& pos) {
                 falloff = 1.0f - t * t * (3.0f - 2.0f * t);
             }
             const float alpha = std::clamp(m_paintOpacity * falloff, 0.0f, 1.0f);
-            QColor src = vertex.color;
-            vertex.color = blendPaintColor(src, target, alpha);
+            const QColor src = vertex.color;
+            const QColor blended = blendPaintColor(src, target, alpha);
+            const QColor finalColor = applyLockedChannels(src, blended);
+            if (finalColor == src) continue;
+            recordColorChange(meshIndex, vertexIndex, src, finalColor);
+            vertex.color = finalColor;
+            meshChanged = true;
             changed = true;
         }
-        if (changed) mesh.hasVertexColor = true;
+        if (meshChanged) mesh.hasVertexColor = true;
     }
 
     if (changed) {
@@ -440,17 +621,60 @@ void ViewportWidget::paintVertexAt(const QPoint& pos) {
 
 void ViewportWidget::fillSelectedMesh() {
     if (!m_scene || m_scene->empty()) return;
+    beginStroke();
     const int targetMesh = m_selectedMesh;
+    bool changed = false;
     for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
         if (targetMesh >= 0 && meshIndex != targetMesh) continue;
         auto& mesh = m_scene->meshes[meshIndex];
-        for (auto& vertex : mesh.vertices) {
-            vertex.color = blendPaintColor(vertex.color, m_paintColor, m_paintOpacity);
+        for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
+            auto& vertex = mesh.vertices[vertexIndex];
+            const QColor src = vertex.color;
+            const QColor blended = blendPaintColor(src, m_paintColor, m_paintOpacity);
+            const QColor finalColor = applyLockedChannels(src, blended);
+            if (finalColor == src) continue;
+            recordColorChange(meshIndex, vertexIndex, src, finalColor);
+            vertex.color = finalColor;
+            changed = true;
         }
-        mesh.hasVertexColor = true;
+        if (changed) mesh.hasVertexColor = true;
     }
-    m_useVertexColor = true;
-    update();
+    if (changed) {
+        m_useVertexColor = true;
+        update();
+        commitPendingStroke();
+    } else {
+        m_pendingStroke.clear();
+        m_pendingStrokeIndex.clear();
+        m_strokeActive = false;
+    }
+}
+
+void ViewportWidget::clearVertexColors() {
+    if (!m_scene || m_scene->empty()) return;
+    beginStroke();
+    bool changed = false;
+    for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
+        auto& mesh = m_scene->meshes[meshIndex];
+        for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
+            auto& vertex = mesh.vertices[vertexIndex];
+            const QColor src = vertex.color;
+            const QColor dst(255, 255, 255, 255);
+            if (src == dst) continue;
+            recordColorChange(meshIndex, vertexIndex, src, dst);
+            vertex.color = dst;
+            changed = true;
+        }
+        mesh.hasVertexColor = false;
+    }
+    if (changed) {
+        update();
+        commitPendingStroke();
+    } else {
+        m_pendingStroke.clear();
+        m_pendingStrokeIndex.clear();
+        m_strokeActive = false;
+    }
 }
 
 void ViewportWidget::mousePressEvent(QMouseEvent* event) {
@@ -460,6 +684,7 @@ void ViewportWidget::mousePressEvent(QMouseEvent* event) {
     m_activeButton = event->button();
     m_dragged = false;
     if (m_vertexPaintEnabled && event->button() == Qt::LeftButton && !(event->modifiers() & Qt::AltModifier)) {
+        beginStroke();
         paintVertexAt(event->pos());
         m_dragged = true;
     }
@@ -498,6 +723,9 @@ void ViewportWidget::mouseMoveEvent(QMouseEvent* event) {
 }
 
 void ViewportWidget::mouseReleaseEvent(QMouseEvent* event) {
+    if (m_vertexPaintEnabled && event->button() == Qt::LeftButton && !(event->modifiers() & Qt::AltModifier)) {
+        commitPendingStroke();
+    }
     const bool clickLike = !m_dragged && (event->pos() - m_pressMousePos).manhattanLength() < 4;
     if (clickLike && event->button() == Qt::LeftButton && !(event->modifiers() & Qt::AltModifier)) {
         const int picked = pickMeshAt(event->pos());
@@ -520,6 +748,16 @@ void ViewportWidget::wheelEvent(QWheelEvent* event) {
 }
 
 void ViewportWidget::keyPressEvent(QKeyEvent* event) {
+    if (event->matches(QKeySequence::Undo)) {
+        undo();
+        event->accept();
+        return;
+    }
+    if (event->matches(QKeySequence::Redo)) {
+        redo();
+        event->accept();
+        return;
+    }
     if (event->key() == Qt::Key_F) {
         resetCamera();
         update();

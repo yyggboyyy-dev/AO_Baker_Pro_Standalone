@@ -4,6 +4,7 @@
 #include "ModelData.h"
 #include "ViewportWidget.h"
 #include <QMainWindow>
+#include <QJsonObject>
 #include <QTreeWidget>
 #include <QLabel>
 #include <QTextEdit>
@@ -13,6 +14,8 @@
 #include <QSpinBox>
 #include <QCheckBox>
 #include <QPushButton>
+#include <QAction>
+#include <QStringList>
 
 class SliderRow : public QWidget {
     Q_OBJECT
@@ -36,8 +39,12 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget* parent = nullptr);
 
+protected:
+    void closeEvent(QCloseEvent* event) override;
+
 private slots:
     void importModel();
+    void importRecentModel();
     void chooseOutputDir();
     void chooseGroundColor();
     void chooseMaterialColor();
@@ -47,6 +54,15 @@ private slots:
     void bakeVertex();
     void bakeTexture();
     void clearScene();
+    void newScene();
+    void saveProject();
+    void saveProjectAs();
+    void loadProject();
+    void openPreferences();
+    void undoActionTriggered();
+    void redoActionTriggered();
+    void clearVertexColors();
+    void batchProcessModels();
     void onMeshSelected(int meshIndex, const QString& meshName);
     void onSettingsChanged();
 
@@ -63,10 +79,29 @@ private:
     void runBake(bool texture);
     void recalculateNormals();
     QString outputBaseName(const QString& suffix) const;
+    void markDirty(bool dirty = true);
+    void updateWindowTitle();
+    bool confirmLoseUnsavedChanges(const QString& actionText);
+    QString projectBaseName() const;
+    void updateStatusSummary();
+    void updateOutputFormatUi();
+    void updateRecentFilesMenu();
+    void addRecentFile(const QString& path);
+    QString settingsDir() const;
+    void loadAppSettings();
+    void saveAppSettings() const;
+    bool saveProjectToFile(const QString& path);
+    bool loadProjectFromFile(const QString& path);
+    QJsonObject saveProjectJson() const;
+    bool restoreProjectJson(const QJsonObject& root);
 
     SceneData m_scene;
     BakeSettings m_settings;
     QString m_outputDir;
+    QString m_currentProjectPath;
+    QString m_lastBakeCachePath;
+    QStringList m_recentFiles;
+    bool m_isDirty = false;
 
     QTreeWidget* m_tree = nullptr;
     QLabel* m_modelInfo = nullptr;
@@ -80,4 +115,15 @@ private:
     QLineEdit* m_outputNameEdit = nullptr;
     QComboBox* m_resolution = nullptr;
     QComboBox* m_format = nullptr;
+    QComboBox* m_bitDepth = nullptr;
+    QComboBox* m_splitMode = nullptr;
+    QLabel* m_formatHint = nullptr;
+    QLabel* m_statusSummary = nullptr;
+    QAction* m_undoAction = nullptr;
+    QAction* m_redoAction = nullptr;
+    QMenu* m_recentFilesMenu = nullptr;
+    QCheckBox* m_ignoreBackfacesCheck = nullptr;
+    QCheckBox* m_lockRedCheck = nullptr;
+    QCheckBox* m_lockGreenCheck = nullptr;
+    QCheckBox* m_lockBlueCheck = nullptr;
 };

@@ -56,6 +56,8 @@ struct BakeSettings {
     float detailPreserve = 0.80f;
     int textureResolution = 2048;
     QString textureFormat = "PNG";
+    QString textureBitDepth = "8-bit";
+    QString textureSplitMode = "单张AO图";
     bool keepSmoothingGroups = true;
     bool keepUVs = true;
     bool adaptiveSampling = true;
