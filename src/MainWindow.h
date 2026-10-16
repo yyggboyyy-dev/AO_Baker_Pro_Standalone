@@ -17,6 +17,9 @@
 #include <QAction>
 #include <QStringList>
 
+class QSplitter;
+class QGroupBox;
+
 class SliderRow : public QWidget {
     Q_OBJECT
 public:
@@ -53,6 +56,7 @@ private slots:
     void unifySmoothingGroups();
     void bakeVertex();
     void bakeTexture();
+    void exportCurrentModel();
     void clearScene();
     void newScene();
     void saveProject();
@@ -63,6 +67,10 @@ private slots:
     void redoActionTriggered();
     void clearVertexColors();
     void batchProcessModels();
+    void runModelChecker();
+    void runUvChecker();
+    void exportLog();
+    void clearLog();
     void onMeshSelected(int meshIndex, const QString& meshName);
     void onSettingsChanged();
 
@@ -85,6 +93,11 @@ private:
     QString projectBaseName() const;
     void updateStatusSummary();
     void updateOutputFormatUi();
+    void applyNativeWindowPolish();
+    void toggleFullScreenViewport();
+    void resetPanelLayout();
+    void savePanelLayout();
+    void restorePanelLayout();
     void updateRecentFilesMenu();
     void addRecentFile(const QString& path);
     QString settingsDir() const;
@@ -94,6 +107,8 @@ private:
     bool loadProjectFromFile(const QString& path);
     QJsonObject saveProjectJson() const;
     bool restoreProjectJson(const QJsonObject& root);
+    bool m_bakeRunning = false;
+    bool m_viewportFullScreen = false;
 
     SceneData m_scene;
     BakeSettings m_settings;
@@ -104,9 +119,21 @@ private:
     bool m_isDirty = false;
 
     QTreeWidget* m_tree = nullptr;
+    QWidget* m_paintColumn = nullptr;
+    QGroupBox* m_modelTreeGroup = nullptr;
+    QGroupBox* m_modelInfoGroup = nullptr;
+    QGroupBox* m_uvGroup = nullptr;
+    QGroupBox* m_logGroup = nullptr;
+    QGroupBox* m_aoSettingsGroup = nullptr;
+    QGroupBox* m_outputGroup = nullptr;
+    QGroupBox* m_previewGroup = nullptr;
+    QGroupBox* m_bakeOutputGroup = nullptr;
+    QWidget* m_rightPanel = nullptr;
+    QWidget* m_leftPanel = nullptr;
     QLabel* m_modelInfo = nullptr;
     QLabel* m_uvInfo = nullptr;
     QTextEdit* m_log = nullptr;
+    QSplitter* m_rootSplitter = nullptr;
     ViewportWidget* m_viewport = nullptr;
     QLabel* m_outputLabel = nullptr;
     QPushButton* m_colorButton = nullptr;
@@ -117,6 +144,9 @@ private:
     QComboBox* m_format = nullptr;
     QComboBox* m_bitDepth = nullptr;
     QComboBox* m_splitMode = nullptr;
+    QComboBox* m_vertexWriteMode = nullptr;
+    QComboBox* m_bakeScope = nullptr;
+    QCheckBox* m_autoOpenOutputDir = nullptr;
     QLabel* m_formatHint = nullptr;
     QLabel* m_statusSummary = nullptr;
     QAction* m_undoAction = nullptr;

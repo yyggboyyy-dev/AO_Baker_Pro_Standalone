@@ -58,6 +58,11 @@ struct BakeSettings {
     QString textureFormat = "PNG";
     QString textureBitDepth = "8-bit";
     QString textureSplitMode = "单张AO图";
+    QString vertexColorChannels = "RGB";
+    QString vertexColorWriteMode = "覆盖";
+    QString bakeScope = "全场景";
+    int selectedMeshIndex = -1;
+    bool autoOpenOutputDir = false;
     bool keepSmoothingGroups = true;
     bool keepUVs = true;
     bool adaptiveSampling = true;

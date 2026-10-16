@@ -496,38 +496,51 @@ QString ModelIO::extensionForAssimp(const QString& filePath, const QString& form
     const QString ext = QFileInfo(filePath).suffix().toLower();
     if (ext == "fbx") return "fbx";
     if (ext == "obj") return "obj";
+    if (ext == "ply") return "ply";
     if (ext == "glb") return "glb2";
     if (ext == "gltf") return "gltf2";
     return "glb2";
 }
 
 void ModelIO::exportModel(const SceneData& sceneData, const QString& filePath, const QString& formatHint) {
+    exportModel(sceneData, filePath, formatHint, ExportOptions{});
+}
+
+void ModelIO::exportModel(const SceneData& sceneData, const QString& filePath, const QString& formatHint, const ExportOptions& options) {
+    QVector<int> meshIndices;
+    if (options.exportOnlySelectedMesh && options.selectedMeshIndex >= 0 && options.selectedMeshIndex < sceneData.meshes.size()) {
+        meshIndices.push_back(options.selectedMeshIndex);
+    } else {
+        for (int i = 0; i < sceneData.meshes.size(); ++i) meshIndices.push_back(i);
+    }
+    if (meshIndices.isEmpty()) throw std::runtime_error("没有可导出的模型网格。");
+
     aiScene scene;
     scene.mRootNode = new aiNode();
     scene.mRootNode->mName = aiString("RootNode");
-    scene.mNumMeshes = static_cast<unsigned int>(sceneData.meshes.size());
+    scene.mNumMeshes = static_cast<unsigned int>(meshIndices.size());
     scene.mMeshes = new aiMesh*[scene.mNumMeshes]();
     scene.mRootNode->mNumMeshes = scene.mNumMeshes;
     scene.mRootNode->mMeshes = new unsigned int[scene.mNumMeshes]();
 
     for (unsigned int mi = 0; mi < scene.mNumMeshes; ++mi) {
-        const MeshData& src = sceneData.meshes[static_cast<int>(mi)];
+        const MeshData& src = sceneData.meshes[meshIndices[static_cast<int>(mi)]];
         aiMesh* mesh = new aiMesh();
         mesh->mName = aiString(src.name.toUtf8().constData());
         mesh->mPrimitiveTypes = aiPrimitiveType_TRIANGLE;
         mesh->mNumVertices = static_cast<unsigned int>(src.vertices.size());
         mesh->mVertices = new aiVector3D[mesh->mNumVertices]();
-        mesh->mNormals = new aiVector3D[mesh->mNumVertices]();
-        mesh->mTextureCoords[0] = src.hasUV ? new aiVector3D[mesh->mNumVertices]() : nullptr;
-        mesh->mNumUVComponents[0] = src.hasUV ? 2 : 0;
-        mesh->mColors[0] = new aiColor4D[mesh->mNumVertices]();
+        mesh->mNormals = options.exportNormals ? new aiVector3D[mesh->mNumVertices]() : nullptr;
+        mesh->mTextureCoords[0] = (options.exportUVs && src.hasUV) ? new aiVector3D[mesh->mNumVertices]() : nullptr;
+        mesh->mNumUVComponents[0] = (options.exportUVs && src.hasUV) ? 2 : 0;
+        mesh->mColors[0] = options.exportVertexColors ? new aiColor4D[mesh->mNumVertices]() : nullptr;
 
         for (unsigned int vi = 0; vi < mesh->mNumVertices; ++vi) {
             const Vertex& v = src.vertices[static_cast<int>(vi)];
             mesh->mVertices[vi] = aiVector3D(v.position.x(), v.position.y(), v.position.z());
-            mesh->mNormals[vi] = aiVector3D(v.normal.x(), v.normal.y(), v.normal.z());
-            if (src.hasUV) mesh->mTextureCoords[0][vi] = aiVector3D(v.uv.x(), v.uv.y(), 0.0f);
-            mesh->mColors[0][vi] = aiColor4D(v.color.redF(), v.color.greenF(), v.color.blueF(), v.color.alphaF());
+            if (options.exportNormals) mesh->mNormals[vi] = aiVector3D(v.normal.x(), v.normal.y(), v.normal.z());
+            if (options.exportUVs && src.hasUV) mesh->mTextureCoords[0][vi] = aiVector3D(v.uv.x(), v.uv.y(), 0.0f);
+            if (options.exportVertexColors) mesh->mColors[0][vi] = aiColor4D(v.color.redF(), v.color.greenF(), v.color.blueF(), v.color.alphaF());
         }
 
         mesh->mNumFaces = static_cast<unsigned int>(src.faces.size());

@@ -16,6 +16,11 @@ public:
     void setScene(SceneData* scene);
     void setBakeSettings(const BakeSettings& settings);
     void setRealtimePreviewEnabled(bool enabled);
+    void setDisplayMode(const QString& mode);
+    void setOrthographicView(bool enabled);
+    void saveCurrentCameraView();
+    void restoreSavedCameraView();
+    void restoreDefaultCameraView();
     void setCameraView(const QString& viewName);
     void focusModel();
     void setWireframeVisible(bool visible);
@@ -28,7 +33,11 @@ public:
     void setPaintColor(const QColor& color);
     void setPaintOpacity(float opacity);
     void setPaintRadius(float radius);
+    void setPaintHardness(float hardness);
     void setPaintSoftBrush(bool enabled);
+    void setPressureSimulationEnabled(bool enabled);
+    void setMirrorPaintingEnabled(bool enabled);
+    void setNormalFalloffEnabled(bool enabled);
     void setLayerOpacity(float opacity);
     void setVisibleChannels(bool red, bool green, bool blue);
     void setIgnoreBackfaces(bool enabled);
@@ -42,6 +51,8 @@ public:
     bool canRedo() const { return !m_redoStack.isEmpty(); }
     void undo();
     void redo();
+    QVector<QVector<QColor>> captureVertexColors() const;
+    void pushVertexColorUndo(const QVector<QVector<QColor>>& beforeColors);
 
     QJsonObject saveViewState() const;
     void restoreViewState(const QJsonObject& state);
@@ -87,11 +98,16 @@ private:
     SceneData* m_scene = nullptr;
     BakeSettings m_settings;
     bool m_realtimePreview = true;
+    bool m_orthographicView = false;
+    QString m_displayMode = QStringLiteral("AO 预览");
     bool m_wireframeVisible = true;
     bool m_useVertexColor = true;
     bool m_vertexPaintEnabled = false;
     bool m_paintEraseMode = false;
     bool m_paintSoftBrush = true;
+    bool m_pressureSimulation = false;
+    bool m_mirrorPainting = false;
+    bool m_normalFalloff = true;
     bool m_ignoreBackfaces = true;
     bool m_lockRed = false;
     bool m_lockGreen = false;
@@ -102,6 +118,7 @@ private:
     bool m_showBlueChannel = true;
     float m_paintOpacity = 1.0f;
     float m_paintRadius = 24.0f;
+    float m_paintHardness = 0.35f;
     float m_layerOpacity = 1.0f;
     QColor m_defaultMaterialColor = QColor(188, 198, 210);
     QColor m_paintColor = QColor(255, 255, 255);
@@ -113,6 +130,11 @@ private:
     float m_distance = 1.0f;
     float m_zoom = 1.0f;
     QPointF m_pan = QPointF(0.0, 0.0);
+    float m_savedYaw = -35.0f;
+    float m_savedPitch = 22.0f;
+    float m_savedDistance = 1.0f;
+    float m_savedZoom = 1.0f;
+    QPointF m_savedPan = QPointF(0.0, 0.0);
     QPoint m_lastMousePos;
     QPoint m_pressMousePos;
     Qt::MouseButton m_activeButton = Qt::NoButton;
@@ -131,6 +153,7 @@ private:
     void updateBounds();
     QVector3D rotateToCamera(const QVector3D& world) const;
     QVector3D rotateDirectionToCamera(const QVector3D& dir) const;
+    QVector3D cameraRightWorld() const;
     ProjectedVertex projectVertex(const QVector3D& world) const;
     QColor previewColor(const MeshData& mesh, const Vertex& v, int meshIndex) const;
     void drawGrid(QPainter& p) const;

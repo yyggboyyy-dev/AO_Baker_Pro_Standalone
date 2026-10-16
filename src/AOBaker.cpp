@@ -259,7 +259,13 @@ void AOBaker::bakeToVertexColor(SceneData& scene, const BakeSettings& settings) 
     const QVector<FastTriangle> tris = collectFastTriangles(scene);
     const BvhTree bvh(tris);
     const QVector<QVector3D> samples = hemisphereSamples(settings.sampleCount);
-    const int total = std::max(1, scene.vertexCount());
+    const bool selectedOnly = settings.bakeScope == QStringLiteral("选中对象") && settings.selectedMeshIndex >= 0;
+    int targetVertexCount = 0;
+    for (int meshIndex = 0; meshIndex < scene.meshes.size(); ++meshIndex) {
+        if (selectedOnly && meshIndex != settings.selectedMeshIndex) continue;
+        targetVertexCount += scene.meshes[meshIndex].vertices.size();
+    }
+    const int total = std::max(1, targetVertexCount);
     int done = 0;
 
     emit progress(QStringLiteral("正在构建 AO 加速结构：%1 个三角面").arg(tris.size()), 1);
@@ -268,7 +274,9 @@ void AOBaker::bakeToVertexColor(SceneData& scene, const BakeSettings& settings) 
                              settings.groundBounceColor.greenF() * 0.7152f +
                              settings.groundBounceColor.blueF() * 0.0722f;
 
-    for (auto& mesh : scene.meshes) {
+    for (int meshIndex = 0; meshIndex < scene.meshes.size(); ++meshIndex) {
+        if (selectedOnly && meshIndex != settings.selectedMeshIndex) continue;
+        auto& mesh = scene.meshes[meshIndex];
         float minZ = std::numeric_limits<float>::max();
         float maxZ = std::numeric_limits<float>::lowest();
         for (const auto& v : mesh.vertices) {
@@ -308,11 +316,28 @@ void AOBaker::bakeToVertexColor(SceneData& scene, const BakeSettings& settings) 
             visible = std::min(1.0f, visible + groundLuma * settings.groundBounceStrength * std::max(0.0f, 1.0f - height));
 
             const float ao = remapAO(visible, settings);
-            vertex.color = QColor::fromRgbF(ao, ao, ao, 1.0f);
+            const QColor oldColor = vertex.color.isValid() ? vertex.color : QColor(255, 255, 255, 255);
+            QColor bakedColor;
+            if (settings.vertexColorWriteMode == QStringLiteral("混合")) {
+                bakedColor = QColor::fromRgbF(std::clamp(float(oldColor.redF() * ao), 0.0f, 1.0f),
+                                              std::clamp(float(oldColor.greenF() * ao), 0.0f, 1.0f),
+                                              std::clamp(float(oldColor.blueF() * ao), 0.0f, 1.0f),
+                                              oldColor.alphaF());
+            } else {
+                bakedColor = QColor::fromRgbF(ao, ao, ao, oldColor.alphaF());
+            }
+
+            QColor finalColor = oldColor;
+            const QString channels = settings.vertexColorChannels.toUpper();
+            if (channels.contains(QStringLiteral("R"))) finalColor.setRed(bakedColor.red());
+            if (channels.contains(QStringLiteral("G"))) finalColor.setGreen(bakedColor.green());
+            if (channels.contains(QStringLiteral("B"))) finalColor.setBlue(bakedColor.blue());
+            vertex.color = finalColor;
 
             ++done;
             if (done % 64 == 0 || done == total) {
-                emit progress(QStringLiteral("AO 快速烘焙：%1/%2（BVH 加速 + 自适应采样）").arg(done).arg(total), int(done * 100.0 / total));
+                emit progress(QStringLiteral("AO 快速烘焙：%1/%2（范围：%3，写入：%4）")
+                    .arg(done).arg(total).arg(settings.bakeScope).arg(settings.vertexColorWriteMode), int(done * 100.0 / total));
             }
         }
         mesh.hasVertexColor = true;

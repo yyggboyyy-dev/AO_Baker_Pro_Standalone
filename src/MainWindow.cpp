@@ -32,6 +32,8 @@
 #include <QGuiApplication>
 #include <QInputDialog>
 #include <QList>
+#include <QMap>
+#include <QPlainTextEdit>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -39,12 +41,16 @@
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QTableWidget>
+#include <QTabWidget>
+#include <QTimer>
 #include <QHeaderView>
 #include <QToolBar>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QAction>
 #include <QAbstractItemView>
+#include <QLibrary>
+#include <QOperatingSystemVersion>
 #include <QVariant>
 #include <QVector3D>
 #include <algorithm>
@@ -56,6 +62,10 @@
 namespace {
 constexpr auto kOrgName = "AO_Baker_Pro";
 constexpr auto kAppName = "AO_Baker_Pro_V2";
+
+#ifdef Q_OS_WIN
+using DwmSetWindowAttributeFn = long(__stdcall *)(void*, unsigned long, const void*, unsigned long);
+#endif
 
 QString normalizedTextureExtension(QString format) {
     format = format.trimmed().toLower();
@@ -183,6 +193,22 @@ QVector<int> collectUdimTiles(const SceneData& scene) {
     return tiles;
 }
 
+float triangleArea3D(const QVector3D& a, const QVector3D& b, const QVector3D& c) {
+    return QVector3D::crossProduct(b - a, c - a).length() * 0.5f;
+}
+
+float triangleAreaUv(const QVector2D& a, const QVector2D& b, const QVector2D& c) {
+    const QVector2D ab = b - a;
+    const QVector2D ac = c - a;
+    return std::abs(ab.x() * ac.y() - ab.y() * ac.x()) * 0.5f;
+}
+
+QString severityText(int warningCount, int errorCount) {
+    if (errorCount > 0) return QStringLiteral("错误");
+    if (warningCount > 0) return QStringLiteral("警告");
+    return QStringLiteral("通过");
+}
+
 Vertex normalizeVertexToUdimTile(Vertex vertex, int udimTile) {
     const int zeroBased = udimTile - 1001;
     const int uTile = zeroBased % 10;
@@ -273,6 +299,22 @@ SceneData buildSceneForUdimTile(const SceneData& scene, int udimTile) {
 
     return filteredScene;
 }
+
+bool sceneHasUvFaces(const SceneData& scene) {
+    for (const auto& mesh : scene.meshes) {
+        if (mesh.hasUV && !mesh.faces.isEmpty()) return true;
+    }
+    return false;
+}
+
+SceneData buildSceneForSelectedMesh(const SceneData& scene, int selectedMeshIndex) {
+    SceneData filteredScene;
+    filteredScene.sourcePath = scene.sourcePath;
+    if (selectedMeshIndex >= 0 && selectedMeshIndex < scene.meshes.size()) {
+        filteredScene.meshes.push_back(scene.meshes[selectedMeshIndex]);
+    }
+    return filteredScene;
+}
 }
 
 SliderRow::SliderRow(float min, float max, float value, int decimals, QWidget* parent)
@@ -307,17 +349,31 @@ void SliderRow::fromEdit() {
 }
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent), m_outputDir(QDir::currentPath() + "/AO_Bake_Output") {
-    setWindowTitle("AO Baker Pro V2");
+    setWindowTitle("AO_Baker_Pro_V2");
+    setWindowFlags(windowFlags() | Qt::Window | Qt::WindowMinimizeButtonHint | Qt::WindowMaximizeButtonHint | Qt::WindowCloseButtonHint);
+    setMinimumSize(960, 620);
     resize(1280, 820);
     buildUi();
     applyStyle();
+    applyNativeWindowPolish();
     loadAppSettings();
     updateWindowTitle();
     updateStatusSummary();
+    log(QString("AO_Baker_Pro_V2 已启动，版本：%1").arg(QCoreApplication::applicationVersion()));
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    if (m_bakeRunning) {
+        QMessageBox::warning(this, "烘焙进行中", "当前烘焙任务仍在运行，请先等待任务完成或取消后再退出。 ");
+        event->ignore();
+        return;
+    }
     if (!confirmLoseUnsavedChanges("退出软件")) {
+        event->ignore();
+        return;
+    }
+    const auto result = QMessageBox::question(this, "确认退出", "确认退出 AO_Baker_Pro_V2？\n窗口位置和 UI 布局将自动保存。", QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+    if (result != QMessageBox::Yes) {
         event->ignore();
         return;
     }
@@ -345,34 +401,9 @@ void MainWindow::buildMenus() {
     fileMenu->addSeparator();
     fileMenu->addAction("保存项目", this, &MainWindow::saveProject, QKeySequence::Save);
     fileMenu->addAction("另存为项目", this, &MainWindow::saveProjectAs, QKeySequence::SaveAs);
-    fileMenu->addAction("保存", this, [this](){
-        if (m_scene.empty()) { QMessageBox::warning(this, "缺少模型", "请先导入模型。"); return; }
-        const QString path = QFileDialog::getSaveFileName(this, "保存模型", outputBaseName("_saved.glb"), "GLB (*.glb);;FBX (*.fbx);;OBJ (*.obj)");
-        if (path.isEmpty()) return;
-        const QString ext = QFileInfo(path).suffix().toLower();
-        const QString fmt = ext == "fbx" ? "fbx" : (ext == "obj" ? "obj" : "glb2");
-        try {
-            ModelIO::exportModel(m_scene, path, fmt);
-            addRecentFile(path);
-            log("模型已保存：" + path);
-        } catch (const std::exception& e) {
-            QMessageBox::critical(this, "保存失败", e.what());
-        }
-    });
-    fileMenu->addAction("导出", this, [this](){
-        if (m_scene.empty()) { QMessageBox::warning(this, "缺少模型", "请先导入模型。"); return; }
-        const QString path = QFileDialog::getSaveFileName(this, "导出模型", outputBaseName("_export.glb"), "GLB (*.glb);;FBX (*.fbx);;OBJ (*.obj)");
-        if (path.isEmpty()) return;
-        const QString ext = QFileInfo(path).suffix().toLower();
-        const QString fmt = ext == "fbx" ? "fbx" : (ext == "obj" ? "obj" : "glb2");
-        try {
-            ModelIO::exportModel(m_scene, path, fmt);
-            addRecentFile(path);
-            log("模型已导出：" + path);
-        } catch (const std::exception& e) {
-            QMessageBox::critical(this, "导出失败", e.what());
-        }
-    });
+    fileMenu->addAction("导出当前模型", this, &MainWindow::exportCurrentModel);
+    fileMenu->addAction("保存", this, &MainWindow::exportCurrentModel);
+    fileMenu->addAction("导出", this, &MainWindow::exportCurrentModel);
     fileMenu->addAction("导出 AO 贴图", this, &MainWindow::bakeTexture);
     fileMenu->addAction("批量导入 / 批量烘焙 / 批量导出", this, &MainWindow::batchProcessModels);
     fileMenu->addSeparator();
@@ -405,12 +436,47 @@ void MainWindow::buildMenus() {
     });
 
     auto* viewMenu = menuBar()->addMenu("视图(&V)");
-    const QStringList views = {"透视图", "正面正交视图", "左侧视图", "右侧视图", "背后视图", "顶部视图", "底部视图"};
-    for (const QString& v : views) {
-        viewMenu->addAction(v, this, [this, v](){ if (m_viewport) m_viewport->setCameraView(v); log("已切换视图：" + v); });
+    auto* displayModeMenu = viewMenu->addMenu("显示模式");
+    const QStringList displayModes = {"实体模式", "材质模式", "顶点色模式", "AO 预览", "AO 贴图预览", "线框模式", "实体 + 线框", "法线显示", "UV 显示", "曲率显示", "过绘制显示", "烘焙误差显示"};
+    for (const QString& mode : displayModes) {
+        displayModeMenu->addAction(mode, this, [this, mode](){ if (m_viewport) m_viewport->setDisplayMode(mode); log("显示模式已切换：" + mode); });
     }
-    viewMenu->addSeparator();
-    viewMenu->addAction("全屏显示模型", this, [this](){ if (m_viewport) m_viewport->focusModel(); log("已全屏适配显示模型。"); });
+    auto* cameraMenu = viewMenu->addMenu("相机视角");
+    cameraMenu->addAction("透视视图", this, [this](){ if (m_viewport) m_viewport->setOrthographicView(false); log("已切换为透视视图。"); });
+    cameraMenu->addAction("正交视图", this, [this](){ if (m_viewport) m_viewport->setOrthographicView(true); log("已切换为正交视图。"); });
+    const QStringList views = {"前视图", "后视图", "左视图", "右视图", "顶视图", "底视图", "正面正交视图", "背后视图", "左侧视图", "右侧视图", "顶部视图", "底部视图", "透视图"};
+    for (const QString& v : views) {
+        cameraMenu->addAction(v, this, [this, v](){ if (m_viewport) m_viewport->setCameraView(v); log("已切换视图：" + v); });
+    }
+    cameraMenu->addSeparator();
+    cameraMenu->addAction("聚焦选中对象", this, [this](){ if (m_viewport) m_viewport->focusModel(); log("已聚焦选中对象 / 当前模型。"); });
+    cameraMenu->addAction("重置相机", this, [this](){ if (m_viewport) m_viewport->restoreDefaultCameraView(); log("已重置相机。"); });
+    cameraMenu->addAction("保存当前视角", this, [this](){ if (m_viewport) m_viewport->saveCurrentCameraView(); log("已保存当前视角。"); });
+    cameraMenu->addAction("恢复默认视角", this, [this](){ if (m_viewport) m_viewport->restoreDefaultCameraView(); log("已恢复默认视角。"); });
+    cameraMenu->addAction("恢复保存视角", this, [this](){ if (m_viewport) m_viewport->restoreSavedCameraView(); log("已恢复保存视角。"); });
+
+    auto* panelMenu = viewMenu->addMenu("面板控制");
+    auto addPanelToggle = [this, panelMenu](const QString& text, QWidget* panel){
+        auto* action = panelMenu->addAction(text);
+        action->setCheckable(true);
+        action->setChecked(true);
+        connect(action, &QAction::toggled, this, [panel](bool checked){ if (panel) panel->setVisible(checked); });
+        return action;
+    };
+    QTimer::singleShot(0, this, [this, panelMenu, addPanelToggle]() mutable {
+        addPanelToggle("显示 / 隐藏顶点绘制面板", m_paintColumn);
+        addPanelToggle("显示 / 隐藏模型树", m_modelTreeGroup);
+        addPanelToggle("显示 / 隐藏模型信息", m_modelInfoGroup);
+        addPanelToggle("显示 / 隐藏 UV 通道", m_uvGroup);
+        addPanelToggle("显示 / 隐藏日志", m_logGroup);
+        addPanelToggle("显示 / 隐藏 AO 设置", m_aoSettingsGroup);
+        addPanelToggle("显示 / 隐藏预览", m_previewGroup);
+        panelMenu->addSeparator();
+        panelMenu->addAction("重置布局", this, &MainWindow::resetPanelLayout);
+        panelMenu->addAction("保存布局", this, &MainWindow::savePanelLayout);
+        panelMenu->addAction("切换全屏视口", this, &MainWindow::toggleFullScreenViewport);
+    });
+
     auto* toggleMenu = viewMenu->addMenu("切换功能");
     auto* wireAction = toggleMenu->addAction("显示 / 隐藏线框");
     wireAction->setCheckable(true); wireAction->setChecked(true);
@@ -423,6 +489,9 @@ void MainWindow::buildMenus() {
     connect(paintAction, &QAction::toggled, this, [this](bool checked){ if (m_viewport) m_viewport->setVertexPaintEnabled(checked); updateStatusSummary(); });
 
     auto* toolMenu = menuBar()->addMenu("工具(&T)");
+    toolMenu->addAction("模型检查器", this, &MainWindow::runModelChecker);
+    toolMenu->addAction("UV 检查器", this, &MainWindow::runUvChecker);
+    toolMenu->addSeparator();
     toolMenu->addAction("烘焙 AO 到贴图", this, &MainWindow::bakeTexture);
     toolMenu->addAction("烘焙 AO 到顶点色", this, &MainWindow::bakeVertex);
     toolMenu->addAction("批量处理队列", this, &MainWindow::batchProcessModels);
@@ -444,25 +513,29 @@ void MainWindow::buildUi() {
     auto* toolbar = addToolBar("工具");
     toolbar->addAction("新建场景", this, &MainWindow::newScene);
     toolbar->addAction("导入模型", this, &MainWindow::importModel);
+    toolbar->addAction("导出模型", this, &MainWindow::exportCurrentModel);
     toolbar->addAction("保存项目", this, &MainWindow::saveProject);
     toolbar->addAction("选择输出目录", this, &MainWindow::chooseOutputDir);
     toolbar->addSeparator();
     toolbar->addAction("烘焙AO到顶点色", this, &MainWindow::bakeVertex);
     toolbar->addAction("烘焙AO到贴图", this, &MainWindow::bakeTexture);
     toolbar->addAction("批量处理", this, &MainWindow::batchProcessModels);
-    toolbar->addAction("修复面片朝向", this, &MainWindow::repairFaceOrientation);
-    toolbar->addAction("统一光滑组", this, &MainWindow::unifySmoothingGroups);
+    toolbar->addAction("模型检查", this, &MainWindow::runModelChecker);
+    toolbar->addAction("UV检查", this, &MainWindow::runUvChecker);
     toolbar->addAction("清空场景", this, &MainWindow::clearScene);
 
-    auto* root = new QSplitter(Qt::Horizontal, this);
+    m_rootSplitter = new QSplitter(Qt::Horizontal, this);
+    auto* root = m_rootSplitter;
     setCentralWidget(root);
 
-    auto* paintColumn = new QWidget(this);
+    m_paintColumn = new QWidget(this);
+    auto* paintColumn = m_paintColumn;
     auto* paintColumnLayout = new QVBoxLayout(paintColumn);
     paintColumnLayout->setContentsMargins(4, 4, 4, 4);
     paintColumnLayout->addWidget(buildVertexPaintPanel(), 1);
 
-    auto* left = new QWidget(this);
+    m_leftPanel = new QWidget(this);
+    auto* left = m_leftPanel;
     auto* leftLayout = new QVBoxLayout(left);
     leftLayout->setContentsMargins(4, 4, 4, 4);
     m_tree = new QTreeWidget(this);
@@ -479,10 +552,28 @@ void MainWindow::buildUi() {
     m_uvInfo->setWordWrap(true);
     m_log = new QTextEdit(this);
     m_log->setReadOnly(true);
-    leftLayout->addWidget(group("模型", m_tree), 3);
-    leftLayout->addWidget(group("模型信息", m_modelInfo), 2);
-    leftLayout->addWidget(group("UV 通道", m_uvInfo), 1);
-    leftLayout->addWidget(group("日志", m_log), 2);
+    auto* logPanel = new QWidget(this);
+    auto* logLayout = new QVBoxLayout(logPanel);
+    logLayout->setContentsMargins(0, 0, 0, 0);
+    auto* logButtons = new QWidget(this);
+    auto* logButtonLayout = new QHBoxLayout(logButtons);
+    logButtonLayout->setContentsMargins(0, 0, 0, 0);
+    auto* exportLogBtn = new QPushButton("导出日志", this);
+    auto* clearLogBtn = new QPushButton("清空日志", this);
+    connect(exportLogBtn, &QPushButton::clicked, this, &MainWindow::exportLog);
+    connect(clearLogBtn, &QPushButton::clicked, this, &MainWindow::clearLog);
+    logButtonLayout->addWidget(exportLogBtn);
+    logButtonLayout->addWidget(clearLogBtn);
+    logLayout->addWidget(m_log, 1);
+    logLayout->addWidget(logButtons);
+    m_modelTreeGroup = qobject_cast<QGroupBox*>(group("模型", m_tree));
+    m_modelInfoGroup = qobject_cast<QGroupBox*>(group("模型信息", m_modelInfo));
+    m_uvGroup = qobject_cast<QGroupBox*>(group("UV 通道", m_uvInfo));
+    m_logGroup = qobject_cast<QGroupBox*>(group("日志", logPanel));
+    leftLayout->addWidget(m_modelTreeGroup, 3);
+    leftLayout->addWidget(m_modelInfoGroup, 2);
+    leftLayout->addWidget(m_uvGroup, 1);
+    leftLayout->addWidget(m_logGroup, 2);
 
     auto* center = new QWidget(this);
     auto* centerLayout = new QVBoxLayout(center);
@@ -493,23 +584,28 @@ void MainWindow::buildUi() {
         if (m_undoAction) m_undoAction->setEnabled(canUndo);
         if (m_redoAction) m_redoAction->setEnabled(canRedo);
     });
-    centerLayout->addWidget(m_viewport, 5);
+    m_previewGroup = qobject_cast<QGroupBox*>(group("预览", m_viewport));
+    centerLayout->addWidget(m_previewGroup, 5);
     auto* bakePanel = new QWidget(this);
     auto* bakeLayout = new QHBoxLayout(bakePanel);
-    auto* vertexBtn = new QPushButton("烘焙到顶点色", this);
-    auto* textureBtn = new QPushButton("烘焙到贴图", this);
+    auto* vertexBtn = new QPushButton("烘焙 AO 到顶点色\n计算每个顶点 AO，写入 RGB，支持覆盖 / 混合", this);
+    auto* textureBtn = new QPushButton("烘焙 AO 到贴图\n检查 UV 和输出路径，生成 AO 贴图", this);
     vertexBtn->setMinimumHeight(72);
     textureBtn->setMinimumHeight(72);
     connect(vertexBtn, &QPushButton::clicked, this, &MainWindow::bakeVertex);
     connect(textureBtn, &QPushButton::clicked, this, &MainWindow::bakeTexture);
     bakeLayout->addWidget(vertexBtn);
     bakeLayout->addWidget(textureBtn);
-    centerLayout->addWidget(group("烘焙输出", bakePanel), 1);
+    m_bakeOutputGroup = qobject_cast<QGroupBox*>(group("烘焙输出", bakePanel));
+    centerLayout->addWidget(m_bakeOutputGroup, 1);
 
-    auto* right = new QWidget(this);
+    m_rightPanel = new QWidget(this);
+    auto* right = m_rightPanel;
     auto* rightLayout = new QVBoxLayout(right);
-    rightLayout->addWidget(buildSettingsPanel(), 5);
-    rightLayout->addWidget(buildOutputPanel(), 2);
+    m_aoSettingsGroup = qobject_cast<QGroupBox*>(buildSettingsPanel());
+    m_outputGroup = qobject_cast<QGroupBox*>(buildOutputPanel());
+    rightLayout->addWidget(m_aoSettingsGroup, 5);
+    rightLayout->addWidget(m_outputGroup, 2);
 
     root->addWidget(paintColumn);
     root->addWidget(left);
@@ -573,12 +669,34 @@ QWidget* MainWindow::buildSettingsPanel() {
     m_materialColorButton = new QPushButton("#bcc6d2", this);
     connect(m_materialColorButton, &QPushButton::clicked, this, &MainWindow::chooseMaterialColor);
     materialLayout->addWidget(m_materialColorButton);
+
+    m_vertexWriteMode = new QComboBox(this);
+    m_vertexWriteMode->addItems({"覆盖", "混合"});
+    m_vertexWriteMode->setCurrentText(m_settings.vertexColorWriteMode);
+    connect(m_vertexWriteMode, &QComboBox::currentTextChanged, this, [this](const QString& v){
+        m_settings.vertexColorWriteMode = v;
+        onSettingsChanged();
+    });
+
+    m_bakeScope = new QComboBox(this);
+    m_bakeScope->addItems({"全场景", "选中对象", "可见对象"});
+    m_bakeScope->setCurrentText(m_settings.bakeScope);
+    connect(m_bakeScope, &QComboBox::currentTextChanged, this, [this](const QString& v){
+        m_settings.bakeScope = v;
+        onSettingsChanged();
+    });
+
+    auto* vertexChannels = new QLabel("RGB", this);
+    vertexChannels->setStyleSheet("color:#9fb5d1; background:#151a20; border:1px solid #39424c; padding:4px;");
     form->addRow(keepSmooth);
     form->addRow(keepUv);
     form->addRow(adaptive);
     form->addRow(wireframe);
     form->addRow(useVertexColor);
     form->addRow("默认材质颜色", materialRow);
+    form->addRow("顶点色写入通道", vertexChannels);
+    form->addRow("顶点色写入方式", m_vertexWriteMode);
+    form->addRow("烘焙范围", m_bakeScope);
     return box;
 }
 
@@ -595,7 +713,7 @@ QWidget* MainWindow::buildVertexPaintPanel() {
     });
     form->addRow("显示通道", showChannel);
 
-    auto* paintEnabled = new QCheckBox("启用手动绘制", this);
+    auto* paintEnabled = new QCheckBox("进入绘制模式 / 启用笔刷光标", this);
     connect(paintEnabled, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setVertexPaintEnabled(v); updateStatusSummary(); });
     form->addRow(paintEnabled);
 
@@ -641,7 +759,24 @@ QWidget* MainWindow::buildVertexPaintPanel() {
     connect(soft, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setPaintSoftBrush(v); markDirty(); });
     form->addRow("笔刷选项", soft);
 
-    m_ignoreBackfacesCheck = new QCheckBox("忽略背面", this);
+    auto* hardness = new SliderRow(0, 1, 0.35f, 2, this);
+    connect(hardness, &SliderRow::valueChanged, this, [this](float v){ if (m_viewport) m_viewport->setPaintHardness(v); markDirty(); });
+    form->addRow("笔刷硬度", hardness);
+
+    auto* pressure = new QCheckBox("压力模拟（鼠标中心压力）", this);
+    connect(pressure, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setPressureSimulationEnabled(v); markDirty(); });
+    form->addRow("压力模拟", pressure);
+
+    auto* mirror = new QCheckBox("镜像绘制（屏幕水平镜像）", this);
+    connect(mirror, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setMirrorPaintingEnabled(v); markDirty(); });
+    form->addRow("镜像绘制", mirror);
+
+    auto* normalFalloff = new QCheckBox("沿法线衰减", this);
+    normalFalloff->setChecked(true);
+    connect(normalFalloff, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setNormalFalloffEnabled(v); markDirty(); });
+    form->addRow("法线衰减", normalFalloff);
+
+    m_ignoreBackfacesCheck = new QCheckBox("绘制时忽略背面", this);
     m_ignoreBackfacesCheck->setChecked(true);
     connect(m_ignoreBackfacesCheck, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setIgnoreBackfaces(v); markDirty(); });
     form->addRow("绘制限制", m_ignoreBackfacesCheck);
@@ -774,6 +909,13 @@ QWidget* MainWindow::buildOutputPanel() {
     form->addRow("格式提示", m_formatHint);
     form->addRow("拆分导出", m_splitMode);
     form->addRow("导出命名", m_outputNameEdit);
+    m_autoOpenOutputDir = new QCheckBox("烘焙完成后自动打开输出目录", this);
+    m_autoOpenOutputDir->setChecked(m_settings.autoOpenOutputDir);
+    connect(m_autoOpenOutputDir, &QCheckBox::toggled, this, [this](bool v){
+        m_settings.autoOpenOutputDir = v;
+        markDirty();
+    });
+    form->addRow("完成动作", m_autoOpenOutputDir);
     form->addRow("输出路径", m_outputLabel);
     form->addRow(pick);
     auto* batch = new QPushButton("批量导入 / 批量烘焙 / 批量导出", this);
@@ -818,6 +960,55 @@ void MainWindow::applyStyle() {
         QSlider::handle:horizontal { width: 12px; background: #2d8cff; margin: -5px 0; border-radius: 6px; }
         QStatusBar { background: #171c22; border-top: 1px solid #39424c; }
     )");
+}
+
+void MainWindow::applyNativeWindowPolish() {
+#ifdef Q_OS_WIN
+    QLibrary dwm(QStringLiteral("dwmapi"));
+    if (!dwm.load()) return;
+    auto setWindowAttribute = reinterpret_cast<DwmSetWindowAttributeFn>(dwm.resolve("DwmSetWindowAttribute"));
+    if (!setWindowAttribute) return;
+    const int enabled = 1;
+    const unsigned long darkModeAttr = QOperatingSystemVersion::current() >= QOperatingSystemVersion(QOperatingSystemVersion::Windows, 10, 0, 22000) ? 20UL : 19UL;
+    setWindowAttribute(reinterpret_cast<void*>(winId()), darkModeAttr, &enabled, sizeof(enabled));
+#endif
+}
+
+void MainWindow::toggleFullScreenViewport() {
+    if (!m_rootSplitter) return;
+    m_viewportFullScreen = !m_viewportFullScreen;
+    if (m_paintColumn) m_paintColumn->setVisible(!m_viewportFullScreen);
+    if (m_leftPanel) m_leftPanel->setVisible(!m_viewportFullScreen);
+    if (m_rightPanel) m_rightPanel->setVisible(!m_viewportFullScreen);
+    if (m_bakeOutputGroup) m_bakeOutputGroup->setVisible(!m_viewportFullScreen);
+    log(m_viewportFullScreen ? "已切换到全屏视口。" : "已退出全屏视口。");
+}
+
+void MainWindow::resetPanelLayout() {
+    if (m_paintColumn) m_paintColumn->setVisible(true);
+    if (m_leftPanel) m_leftPanel->setVisible(true);
+    if (m_rightPanel) m_rightPanel->setVisible(true);
+    if (m_modelTreeGroup) m_modelTreeGroup->setVisible(true);
+    if (m_modelInfoGroup) m_modelInfoGroup->setVisible(true);
+    if (m_uvGroup) m_uvGroup->setVisible(true);
+    if (m_logGroup) m_logGroup->setVisible(true);
+    if (m_aoSettingsGroup) m_aoSettingsGroup->setVisible(true);
+    if (m_outputGroup) m_outputGroup->setVisible(true);
+    if (m_previewGroup) m_previewGroup->setVisible(true);
+    if (m_bakeOutputGroup) m_bakeOutputGroup->setVisible(true);
+    if (m_rootSplitter) m_rootSplitter->setSizes({170, 250, 640, 360});
+    m_viewportFullScreen = false;
+    log("布局已重置。");
+}
+
+void MainWindow::savePanelLayout() {
+    saveAppSettings();
+    log("布局已保存。");
+}
+
+void MainWindow::restorePanelLayout() {
+    loadAppSettings();
+    log("布局已恢复。");
 }
 
 void MainWindow::importModel() {
@@ -965,68 +1156,143 @@ void MainWindow::runBake(bool texture) {
         QMessageBox::warning(this, "缺少模型", "请先导入模型。");
         return;
     }
-    QDir().mkpath(m_outputDir);
-    QProgressDialog progress("正在烘焙 AO...", "取消", 0, 100, this);
+    if (m_bakeRunning) {
+        QMessageBox::warning(this, "烘焙进行中", "当前已有烘焙任务正在运行，请等待完成或取消后再执行。 ");
+        return;
+    }
+
+    BakeSettings activeSettings = m_settings;
+    activeSettings.vertexColorChannels = QStringLiteral("RGB");
+    activeSettings.selectedMeshIndex = m_viewport ? m_viewport->selectedMesh() : -1;
+    if (activeSettings.bakeScope == QStringLiteral("选中对象") && activeSettings.selectedMeshIndex < 0) {
+        QMessageBox::warning(this, "未选择对象", "当前烘焙范围为“选中对象”，请先在视口或模型树中选择一个 Mesh。");
+        return;
+    }
+    if (activeSettings.bakeScope == QStringLiteral("可见对象")) {
+        log("当前版本尚未提供 Mesh 显隐状态记录，本次“可见对象”按全场景执行。 ");
+    }
+
+    SceneData textureScene = m_scene;
+    if (activeSettings.bakeScope == QStringLiteral("选中对象")) {
+        textureScene = buildSceneForSelectedMesh(m_scene, activeSettings.selectedMeshIndex);
+    }
+    if (texture && !sceneHasUvFaces(textureScene)) {
+        QMessageBox::warning(this, "UV 检查未通过", "AO 烘焙到贴图需要模型包含有效 UV。请先导入带 UV 的模型，或运行 UV 检查器查看详情。");
+        return;
+    }
+
+    if (m_outputDir.trimmed().isEmpty()) {
+        QMessageBox::warning(this, "输出路径无效", "请先选择有效输出目录。");
+        return;
+    }
+    QDir outputDir(m_outputDir);
+    if (!outputDir.exists() && !QDir().mkpath(m_outputDir)) {
+        QMessageBox::warning(this, "输出路径不可用", "无法创建输出目录：\n" + m_outputDir);
+        return;
+    }
+    if (!outputDir.exists()) outputDir = QDir(m_outputDir);
+    QFile testFile(outputDir.filePath(QStringLiteral(".ao_baker_write_test.tmp")));
+    if (!testFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QMessageBox::warning(this, "输出路径不可写", "当前输出目录不可写：\n" + m_outputDir);
+        return;
+    }
+    testFile.write("ok");
+    testFile.close();
+    testFile.remove();
+
+    m_bakeRunning = true;
+    const auto beforeColors = m_viewport ? m_viewport->captureVertexColors() : QVector<QVector<QColor>>();
+    QProgressDialog progress(texture ? "正在烘焙 AO 到贴图..." : "正在烘焙 AO 到顶点色...", "取消", 0, 100, this);
     progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
     progress.show();
 
     try {
         AOBaker baker;
         connect(&baker, &AOBaker::progress, this, [&](const QString& msg, int percent){
-            progress.setValue(percent);
+            progress.setValue(std::clamp(percent, 0, 99));
             progress.setLabelText(msg);
             QApplication::processEvents();
             log(msg);
             if (progress.wasCanceled()) throw std::runtime_error("用户取消烘焙");
         });
-        baker.bakeToVertexColor(m_scene, m_settings);
+
+        log(QString("开始 AO 烘焙：模式=%1，范围=%2，顶点色写入=%3，通道=RGB，采样=%4，距离=%5")
+            .arg(texture ? QStringLiteral("贴图") : QStringLiteral("顶点色"))
+            .arg(activeSettings.bakeScope)
+            .arg(activeSettings.vertexColorWriteMode)
+            .arg(activeSettings.sampleCount)
+            .arg(activeSettings.rayDistance));
+
+        baker.bakeToVertexColor(m_scene, activeSettings);
+        if (m_viewport) m_viewport->pushVertexColorUndo(beforeColors);
+        if (activeSettings.bakeScope == QStringLiteral("选中对象")) {
+            textureScene = buildSceneForSelectedMesh(m_scene, activeSettings.selectedMeshIndex);
+        } else {
+            textureScene = m_scene;
+        }
+
         const QString modelOut = outputBaseName(texture ? "_ao_texture.glb" : "_ao_vertex.glb");
         ModelIO::exportModel(m_scene, modelOut, "glb2");
         QString message = "模型已输出：\n" + modelOut;
         m_lastBakeCachePath = modelOut;
         addRecentFile(modelOut);
+
         if (texture) {
+            progress.setLabelText("正在生成 AO 贴图...");
+            QApplication::processEvents();
+            if (progress.wasCanceled()) throw std::runtime_error("用户取消烘焙");
+
             QString ext = m_settings.textureFormat.toLower();
             if (ext == "jpeg") ext = "jpg";
             const QString outputPattern = m_outputNameEdit ? m_outputNameEdit->text().trimmed() : QString();
             QStringList textureOutputs;
-            if (m_settings.textureSplitMode == QStringLiteral("按Mesh拆分")) {
-                for (int meshIndex = 0; meshIndex < m_scene.meshes.size(); ++meshIndex) {
-                    const auto& mesh = m_scene.meshes[meshIndex];
+            if (activeSettings.textureSplitMode == QStringLiteral("按Mesh拆分")) {
+                for (int meshIndex = 0; meshIndex < textureScene.meshes.size(); ++meshIndex) {
+                    if (progress.wasCanceled()) throw std::runtime_error("用户取消烘焙");
+                    const auto& mesh = textureScene.meshes[meshIndex];
                     if (!mesh.hasUV) continue;
                     SceneData single;
-                    single.sourcePath = m_scene.sourcePath;
+                    single.sourcePath = textureScene.sourcePath;
                     single.meshes.push_back(mesh);
                     const QString safeMeshName = meshOutputToken(mesh, meshIndex);
                     const QString texOut = buildTextureOutputPath(m_outputDir, outputPattern, m_scene.sourcePath, "_" + safeMeshName + "_AO", ext, safeMeshName);
-                    TextureRasterizer::bakeAOTexture(single, texOut, m_settings);
+                    progress.setLabelText(QString("正在输出 AO 贴图：%1").arg(QFileInfo(texOut).fileName()));
+                    QApplication::processEvents();
+                    TextureRasterizer::bakeAOTexture(single, texOut, activeSettings);
                     textureOutputs << texOut;
                     addRecentFile(texOut);
                 }
                 if (textureOutputs.isEmpty()) {
                     throw std::runtime_error("按 Mesh 拆分导出失败：没有检测到带 UV 的 Mesh。");
                 }
-            } else if (m_settings.textureSplitMode == QStringLiteral("按材质拆分")) {
-                const QVector<int> materialIndices = collectUvMaterialIndices(m_scene);
+            } else if (activeSettings.textureSplitMode == QStringLiteral("按材质拆分")) {
+                const QVector<int> materialIndices = collectUvMaterialIndices(textureScene);
                 for (int materialIndex : materialIndices) {
-                    const SceneData materialScene = buildSceneForMaterial(m_scene, materialIndex);
+                    if (progress.wasCanceled()) throw std::runtime_error("用户取消烘焙");
+                    const SceneData materialScene = buildSceneForMaterial(textureScene, materialIndex);
                     if (materialScene.meshes.isEmpty()) continue;
                     const QString materialToken = materialOutputToken(materialIndex);
                     const QString texOut = buildTextureOutputPath(m_outputDir, outputPattern, m_scene.sourcePath, "_" + materialToken + "_AO", ext, QString(), materialToken);
-                    TextureRasterizer::bakeAOTexture(materialScene, texOut, m_settings);
+                    progress.setLabelText(QString("正在输出 AO 贴图：%1").arg(QFileInfo(texOut).fileName()));
+                    QApplication::processEvents();
+                    TextureRasterizer::bakeAOTexture(materialScene, texOut, activeSettings);
                     textureOutputs << texOut;
                     addRecentFile(texOut);
                 }
                 if (textureOutputs.isEmpty()) {
                     throw std::runtime_error("按材质拆分导出失败：没有检测到带 UV 的材质面。");
                 }
-            } else if (m_settings.textureSplitMode == QStringLiteral("UDIM拆分")) {
-                const QVector<int> udimTiles = collectUdimTiles(m_scene);
+            } else if (activeSettings.textureSplitMode == QStringLiteral("UDIM拆分")) {
+                const QVector<int> udimTiles = collectUdimTiles(textureScene);
                 for (int udimTile : udimTiles) {
-                    const SceneData udimScene = buildSceneForUdimTile(m_scene, udimTile);
+                    if (progress.wasCanceled()) throw std::runtime_error("用户取消烘焙");
+                    const SceneData udimScene = buildSceneForUdimTile(textureScene, udimTile);
                     if (udimScene.meshes.isEmpty()) continue;
                     const QString texOut = buildTextureOutputPath(m_outputDir, outputPattern, m_scene.sourcePath, "_" + udimOutputToken(udimTile) + "_AO", ext, QString(), QString(), udimOutputToken(udimTile));
-                    TextureRasterizer::bakeAOTexture(udimScene, texOut, m_settings);
+                    progress.setLabelText(QString("正在输出 AO 贴图：%1").arg(QFileInfo(texOut).fileName()));
+                    QApplication::processEvents();
+                    TextureRasterizer::bakeAOTexture(udimScene, texOut, activeSettings);
                     textureOutputs << texOut;
                     addRecentFile(texOut);
                 }
@@ -1035,7 +1301,10 @@ void MainWindow::runBake(bool texture) {
                 }
             } else {
                 const QString texOut = buildTextureOutputPath(m_outputDir, outputPattern, m_scene.sourcePath, "_AO", ext);
-                TextureRasterizer::bakeAOTexture(m_scene, texOut, m_settings);
+                progress.setLabelText(QString("正在输出 AO 贴图：%1").arg(QFileInfo(texOut).fileName()));
+                QApplication::processEvents();
+                if (progress.wasCanceled()) throw std::runtime_error("用户取消烘焙");
+                TextureRasterizer::bakeAOTexture(textureScene, texOut, activeSettings);
                 textureOutputs << texOut;
                 addRecentFile(texOut);
             }
@@ -1043,9 +1312,16 @@ void MainWindow::runBake(bool texture) {
             message += "\nAO 贴图已输出：\n" + textureOutputs.join("\n");
         }
         progress.setValue(100);
-        if (m_viewport) m_viewport->update();
+        if (m_viewport) {
+            m_viewport->setScene(&m_scene);
+            m_viewport->setBakeSettings(m_settings);
+            m_viewport->update();
+        }
         markDirty();
         log(message);
+        if (m_settings.autoOpenOutputDir) {
+            QDesktopServices::openUrl(QUrl::fromLocalFile(m_outputDir));
+        }
         QMessageBox msgBox(this);
         msgBox.setWindowTitle("完成");
         msgBox.setText(message);
@@ -1062,10 +1338,126 @@ void MainWindow::runBake(bool texture) {
         QMessageBox::critical(this, "烘焙失败", e.what());
         log(QString("烘焙失败：") + e.what());
     }
+    m_bakeRunning = false;
 }
 
 void MainWindow::bakeVertex() { runBake(false); }
 void MainWindow::bakeTexture() { runBake(true); }
+
+void MainWindow::exportCurrentModel() {
+    if (m_scene.empty()) {
+        QMessageBox::warning(this, "缺少模型", "请先导入模型。");
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle("导出当前模型");
+    dialog.resize(520, 360);
+    auto* layout = new QVBoxLayout(&dialog);
+
+    auto* form = new QFormLayout();
+    auto* formatCombo = new QComboBox(&dialog);
+    formatCombo->addItems({"GLB", "GLTF", "FBX", "OBJ", "PLY"});
+    formatCombo->setCurrentText("GLB");
+    form->addRow("导出格式", formatCombo);
+
+    auto* pathRow = new QWidget(&dialog);
+    auto* pathLayout = new QHBoxLayout(pathRow);
+    pathLayout->setContentsMargins(0, 0, 0, 0);
+    auto* pathEdit = new QLineEdit(outputBaseName("_export.glb"), &dialog);
+    auto* browseButton = new QPushButton("选择...", &dialog);
+    pathLayout->addWidget(pathEdit, 1);
+    pathLayout->addWidget(browseButton);
+    form->addRow("导出路径", pathRow);
+    layout->addLayout(form);
+
+    auto updatePathExtension = [pathEdit](const QString& format){
+        QString path = pathEdit->text().trimmed();
+        if (path.isEmpty()) return;
+        const QString ext = format.toLower();
+        QFileInfo info(path);
+        pathEdit->setText(info.dir().filePath(info.completeBaseName() + "." + ext));
+    };
+    connect(formatCombo, &QComboBox::currentTextChanged, this, updatePathExtension);
+    connect(browseButton, &QPushButton::clicked, this, [this, formatCombo, pathEdit](){
+        const QString fmt = formatCombo->currentText().toLower();
+        const QString filter = "FBX (*.fbx);;OBJ (*.obj);;glTF (*.gltf);;GLB (*.glb);;PLY (*.ply)";
+        const QString path = QFileDialog::getSaveFileName(this, "导出当前模型", pathEdit->text(), filter);
+        if (!path.isEmpty()) pathEdit->setText(path);
+    });
+
+    auto* optionsBox = new QGroupBox("可选导出内容", &dialog);
+    auto* optionsLayout = new QVBoxLayout(optionsBox);
+    auto* normalsCheck = new QCheckBox("导出法线 / 软硬边结果", &dialog);
+    auto* uvCheck = new QCheckBox("导出 UV", &dialog);
+    auto* vertexColorCheck = new QCheckBox("导出顶点色 / AO 结果", &dialog);
+    auto* selectedOnlyCheck = new QCheckBox("仅导出当前选中 Mesh", &dialog);
+    normalsCheck->setChecked(true);
+    uvCheck->setChecked(true);
+    vertexColorCheck->setChecked(true);
+    selectedOnlyCheck->setChecked(m_viewport && m_viewport->selectedMesh() >= 0);
+    selectedOnlyCheck->setEnabled(m_viewport && m_viewport->selectedMesh() >= 0);
+    optionsLayout->addWidget(normalsCheck);
+    optionsLayout->addWidget(uvCheck);
+    optionsLayout->addWidget(vertexColorCheck);
+    optionsLayout->addWidget(selectedOnlyCheck);
+    layout->addWidget(optionsBox);
+
+    auto* hint = new QLabel("支持 FBX / OBJ / GLTF / GLB / PLY。不同格式对顶点色、材质、UV 的兼容程度取决于目标软件读取能力。", &dialog);
+    hint->setWordWrap(true);
+    layout->addWidget(hint);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText("导出");
+    buttons->button(QDialogButtonBox::Cancel)->setText("取消");
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    QString path = pathEdit->text().trimmed();
+    if (path.isEmpty()) {
+        QMessageBox::warning(this, "导出失败", "请选择导出路径。");
+        return;
+    }
+
+    QString ext = QFileInfo(path).suffix().toLower();
+    const QString requestedExt = formatCombo->currentText().toLower();
+    if (ext.isEmpty()) {
+        path += "." + requestedExt;
+        ext = requestedExt;
+    }
+
+    QString fmt;
+    if (ext == "fbx") fmt = "fbx";
+    else if (ext == "obj") fmt = "obj";
+    else if (ext == "gltf") fmt = "gltf2";
+    else if (ext == "glb") fmt = "glb2";
+    else if (ext == "ply") fmt = "ply";
+    else {
+        QMessageBox::warning(this, "格式不支持", "当前仅支持导出 FBX / OBJ / GLTF / GLB / PLY。");
+        return;
+    }
+
+    ModelIO::ExportOptions options;
+    options.exportNormals = normalsCheck->isChecked();
+    options.exportUVs = uvCheck->isChecked();
+    options.exportVertexColors = vertexColorCheck->isChecked();
+    options.exportOnlySelectedMesh = selectedOnlyCheck->isChecked();
+    options.selectedMeshIndex = m_viewport ? m_viewport->selectedMesh() : -1;
+
+    try {
+        ModelIO::exportModel(m_scene, path, fmt, options);
+        addRecentFile(path);
+        m_lastBakeCachePath = path;
+        log("当前模型已导出：" + path);
+        QMessageBox::information(this, "导出完成", "模型已导出：\n" + path);
+    } catch (const std::exception& e) {
+        QMessageBox::critical(this, "导出失败", e.what());
+        log(QString("模型导出失败：") + e.what());
+    }
+}
 
 void MainWindow::undoActionTriggered() {
     if (m_viewport) {
@@ -1467,7 +1859,314 @@ void MainWindow::loadProject() {
 }
 
 void MainWindow::openPreferences() {
-    QMessageBox::information(this, "首选项", QString("当前已接入：\n- 最近文件记录\n- 输出目录持久化\n- 窗口几何与布局保存\n- AO 参数与输出格式保存\n- 视口状态保存\n- 位深/拆分导出设置\n- 批处理队列入口\n\n后续可继续补充快捷键、语言、自动保存周期等完整首选项面板。"));
+    QDialog dialog(this);
+    dialog.setWindowTitle("首选项");
+    dialog.resize(820, 560);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* tabs = new QTabWidget(&dialog);
+    auto makeTab = [&dialog](const QStringList& rows) {
+        auto* widget = new QWidget(&dialog);
+        auto* form = new QFormLayout(widget);
+        for (const QString& row : rows) {
+            auto* edit = new QLineEdit(&dialog);
+            edit->setText(row.section('|', 1));
+            form->addRow(row.section('|', 0, 0), edit);
+        }
+        return widget;
+    };
+    tabs->addTab(makeTab({"启动行为|恢复上次窗口与布局", "最近文件数量|10", "项目格式|.aobproj"}), "通用设置");
+    tabs->addTab(makeTab({"导航方式|Maya Alt+鼠标", "默认线框|开启", "实时预览|开启", "默认材质色|#bcc6d2"}), "视口设置");
+    tabs->addTab(makeTab({"默认导入|保留 UV / 法线 / 顶点色", "默认导出|GLB", "导出内容|法线、UV、顶点色"}), "导入导出设置");
+    tabs->addTab(makeTab({"采样数|" + QString::number(m_settings.sampleCount), "射线距离|" + QString::number(m_settings.rayDistance), "自适应采样|开启"}), "烘焙设置");
+    tabs->addTab(makeTab({"画笔大小|24", "不透明度|1.0", "软笔刷|开启", "忽略背面|开启"}), "顶点绘制设置");
+    tabs->addTab(makeTab({"性能模式|平衡", "大模型策略|增量记录顶点色", "批处理失败|继续执行"}), "性能设置");
+    tabs->addTab(makeTab({"撤销|Ctrl+Z", "重做|Ctrl+Y / Ctrl+Shift+Z", "聚焦模型|F"}), "快捷键设置");
+    tabs->addTab(makeTab({"自动保存|开启", "自动恢复文件|autosave_recovery.aobproj", "保存间隔|退出和关键操作时"}), "自动保存设置");
+    tabs->addTab(makeTab({"主题|深色", "Windows 标题栏|暗色适配", "高 DPI|开启"}), "主题设置");
+    tabs->addTab(makeTab({"语言|简体中文", "后续扩展|English / 多语言资源"}), "语言设置");
+    layout->addWidget(tabs, 1);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText("保存并关闭");
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    layout->addWidget(buttons);
+    if (dialog.exec() == QDialog::Accepted) {
+        saveAppSettings();
+        log("首选项已保存。");
+    }
+}
+
+void MainWindow::runModelChecker() {
+    if (m_scene.empty()) {
+        QMessageBox::warning(this, "模型检查器", "请先导入模型。");
+        return;
+    }
+
+    QStringList report;
+    int errorCount = 0;
+    int warningCount = 0;
+    int emptyMeshes = 0;
+    int invalidFaces = 0;
+    int degenerateFaces = 0;
+    int missingNormalMeshes = 0;
+    int missingUvMeshes = 0;
+    int missingVertexColorMeshes = 0;
+    int smoothingFaces = 0;
+
+    report << "AO Baker Pro V2 模型检查报告";
+    report << "生成时间：" + QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+    report << "源文件：" + (m_scene.sourcePath.isEmpty() ? QStringLiteral("未保存/项目内模型") : m_scene.sourcePath);
+    report << "";
+    report << QString("总览：Mesh %1，顶点 %2，三角面 %3，UV Mesh %4")
+        .arg(m_scene.meshes.size())
+        .arg(m_scene.vertexCount())
+        .arg(m_scene.faceCount())
+        .arg(m_scene.uvMeshCount());
+    report << "";
+
+    for (int meshIndex = 0; meshIndex < m_scene.meshes.size(); ++meshIndex) {
+        const MeshData& mesh = m_scene.meshes[meshIndex];
+        int meshInvalidFaces = 0;
+        int meshDegenerateFaces = 0;
+        int meshSmoothingFaces = 0;
+
+        if (mesh.vertices.isEmpty() || mesh.faces.isEmpty()) {
+            ++emptyMeshes;
+            ++warningCount;
+        }
+        if (!mesh.hasNormals) {
+            ++missingNormalMeshes;
+            ++warningCount;
+        }
+        if (!mesh.hasUV) {
+            ++missingUvMeshes;
+            ++warningCount;
+        }
+        if (!mesh.hasVertexColor) {
+            ++missingVertexColorMeshes;
+        }
+
+        for (const Face& face : mesh.faces) {
+            const bool invalid = face.i0 < 0 || face.i1 < 0 || face.i2 < 0
+                || face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size();
+            if (invalid) {
+                ++invalidFaces;
+                ++meshInvalidFaces;
+                continue;
+            }
+
+            const float area = triangleArea3D(mesh.vertices[face.i0].position, mesh.vertices[face.i1].position, mesh.vertices[face.i2].position);
+            if (area < 1e-8f) {
+                ++degenerateFaces;
+                ++meshDegenerateFaces;
+            }
+            if (face.smoothingMask != 0) {
+                ++smoothingFaces;
+                ++meshSmoothingFaces;
+            }
+        }
+
+        report << QString("Mesh #%1：%2").arg(meshIndex + 1).arg(mesh.name.isEmpty() ? QStringLiteral("Unnamed") : mesh.name);
+        report << QString("  顶点：%1，三角面：%2，UV：%3，法线：%4，顶点色：%5")
+            .arg(mesh.vertices.size())
+            .arg(mesh.faces.size())
+            .arg(mesh.hasUV ? "有" : "缺失")
+            .arg(mesh.hasNormals ? "有" : "缺失")
+            .arg(mesh.hasVertexColor ? "有" : "缺失");
+        report << QString("  无效面：%1，零面积面：%2，含光滑组标记面：%3")
+            .arg(meshInvalidFaces)
+            .arg(meshDegenerateFaces)
+            .arg(meshSmoothingFaces);
+    }
+
+    if (invalidFaces > 0) errorCount += invalidFaces;
+    if (degenerateFaces > 0) warningCount += degenerateFaces;
+
+    report << "";
+    report << "检查结论：" + severityText(warningCount, errorCount);
+    report << QString("错误：%1，警告：%2").arg(errorCount).arg(warningCount);
+    report << QString("空 Mesh：%1，缺失法线 Mesh：%2，缺失 UV Mesh：%3，未携带顶点色 Mesh：%4")
+        .arg(emptyMeshes)
+        .arg(missingNormalMeshes)
+        .arg(missingUvMeshes)
+        .arg(missingVertexColorMeshes);
+    report << QString("无效三角面：%1，零面积三角面：%2，带光滑组信息三角面：%3")
+        .arg(invalidFaces)
+        .arg(degenerateFaces)
+        .arg(smoothingFaces);
+    report << "";
+    report << "建议：";
+    if (invalidFaces > 0) report << "- 存在无效三角面索引，建议重新导出模型或清理拓扑后再烘焙。";
+    if (degenerateFaces > 0) report << "- 存在零面积面，可能导致 AO 或 UV 光栅化结果异常，建议在 DCC 中清理。";
+    if (missingNormalMeshes > 0) report << "- 存在缺失法线的 Mesh，可使用“修复面片朝向”或“统一光滑组”重新计算法线。";
+    if (missingUvMeshes > 0) report << "- 存在缺失 UV 的 Mesh，贴图烘焙会跳过这些 Mesh；顶点色烘焙不受影响。";
+    if (invalidFaces == 0 && degenerateFaces == 0 && missingNormalMeshes == 0 && missingUvMeshes == 0) report << "- 当前模型结构适合继续进行 AO 顶点色与贴图烘焙。";
+
+    const QString reportText = report.join("\n");
+    QDialog dialog(this);
+    dialog.setWindowTitle("模型检查器");
+    dialog.resize(780, 560);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* text = new QPlainTextEdit(reportText, &dialog);
+    text->setReadOnly(true);
+    layout->addWidget(text, 1);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText("关闭");
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    layout->addWidget(buttons);
+    log(QString("模型检查完成：%1，错误 %2，警告 %3").arg(severityText(warningCount, errorCount)).arg(errorCount).arg(warningCount));
+    dialog.exec();
+}
+
+void MainWindow::runUvChecker() {
+    if (m_scene.empty()) {
+        QMessageBox::warning(this, "UV 检查器", "请先导入模型。");
+        return;
+    }
+
+    QStringList report;
+    QMap<int, int> udimFaceCount;
+    int errorCount = 0;
+    int warningCount = 0;
+    int meshesWithoutUv = 0;
+    int invalidFaces = 0;
+    int zeroUvAreaFaces = 0;
+    int outOfRangeFaces = 0;
+    int crossTileFaces = 0;
+    int uvFaces = 0;
+
+    report << "AO Baker Pro V2 UV 检查报告";
+    report << "生成时间：" + QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
+    report << "源文件：" + (m_scene.sourcePath.isEmpty() ? QStringLiteral("未保存/项目内模型") : m_scene.sourcePath);
+    report << "";
+
+    for (int meshIndex = 0; meshIndex < m_scene.meshes.size(); ++meshIndex) {
+        const MeshData& mesh = m_scene.meshes[meshIndex];
+        int meshUvFaces = 0;
+        int meshZeroUv = 0;
+        int meshOutOfRange = 0;
+        int meshCrossTile = 0;
+
+        if (!mesh.hasUV) {
+            ++meshesWithoutUv;
+            ++warningCount;
+            report << QString("Mesh #%1：%2 缺失 UV，贴图烘焙将跳过。")
+                .arg(meshIndex + 1)
+                .arg(mesh.name.isEmpty() ? QStringLiteral("Unnamed") : mesh.name);
+            continue;
+        }
+
+        for (const Face& face : mesh.faces) {
+            const bool invalid = face.i0 < 0 || face.i1 < 0 || face.i2 < 0
+                || face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size();
+            if (invalid) {
+                ++invalidFaces;
+                continue;
+            }
+
+            const QVector2D uv0 = mesh.vertices[face.i0].uv;
+            const QVector2D uv1 = mesh.vertices[face.i1].uv;
+            const QVector2D uv2 = mesh.vertices[face.i2].uv;
+            ++uvFaces;
+            ++meshUvFaces;
+
+            if (triangleAreaUv(uv0, uv1, uv2) < 1e-10f) {
+                ++zeroUvAreaFaces;
+                ++meshZeroUv;
+            }
+
+            const bool outOf01 = uv0.x() < 0.0f || uv0.y() < 0.0f || uv1.x() < 0.0f || uv1.y() < 0.0f || uv2.x() < 0.0f || uv2.y() < 0.0f
+                || uv0.x() > 1.0f || uv0.y() > 1.0f || uv1.x() > 1.0f || uv1.y() > 1.0f || uv2.x() > 1.0f || uv2.y() > 1.0f;
+            if (outOf01) {
+                ++outOfRangeFaces;
+                ++meshOutOfRange;
+            }
+
+            const int t0 = udimTileForUv(uv0);
+            const int t1 = udimTileForUv(uv1);
+            const int t2 = udimTileForUv(uv2);
+            const int tile = udimTileForFace(mesh, face);
+            if (tile >= 1001) udimFaceCount[tile] += 1;
+            if (t0 >= 1001 && t1 >= 1001 && t2 >= 1001 && (t0 != t1 || t1 != t2)) {
+                ++crossTileFaces;
+                ++meshCrossTile;
+            }
+        }
+
+        report << QString("Mesh #%1：%2").arg(meshIndex + 1).arg(mesh.name.isEmpty() ? QStringLiteral("Unnamed") : mesh.name);
+        report << QString("  UV 面：%1，零面积 UV 面：%2，0-1 外 UV 面：%3，跨 UDIM 面：%4")
+            .arg(meshUvFaces)
+            .arg(meshZeroUv)
+            .arg(meshOutOfRange)
+            .arg(meshCrossTile);
+    }
+
+    if (invalidFaces > 0) errorCount += invalidFaces;
+    if (zeroUvAreaFaces > 0) warningCount += zeroUvAreaFaces;
+    if (outOfRangeFaces > 0) warningCount += outOfRangeFaces;
+    if (crossTileFaces > 0) warningCount += crossTileFaces;
+
+    report << "";
+    report << "UDIM 分布：";
+    if (udimFaceCount.isEmpty()) {
+        report << "- 未检测到有效 UDIM tile；如果使用单张 AO 图，UV 应尽量位于 0-1。";
+    } else {
+        for (auto it = udimFaceCount.constBegin(); it != udimFaceCount.constEnd(); ++it) {
+            report << QString("- UDIM %1：%2 面").arg(it.key()).arg(it.value());
+        }
+    }
+
+    report << "";
+    report << "检查结论：" + severityText(warningCount, errorCount);
+    report << QString("错误：%1，警告：%2").arg(errorCount).arg(warningCount);
+    report << QString("带 UV 面：%1，缺失 UV Mesh：%2，无效面：%3，零面积 UV 面：%4，0-1 外 UV 面：%5，跨 UDIM 面：%6")
+        .arg(uvFaces)
+        .arg(meshesWithoutUv)
+        .arg(invalidFaces)
+        .arg(zeroUvAreaFaces)
+        .arg(outOfRangeFaces)
+        .arg(crossTileFaces);
+    report << "";
+    report << "建议：";
+    if (meshesWithoutUv > 0) report << "- 缺失 UV 的 Mesh 无法输出 AO 贴图，需要补 UV 或仅使用顶点色烘焙。";
+    if (zeroUvAreaFaces > 0) report << "- 零面积 UV 面可能造成贴图空洞，建议重新展开或焊接 UV。";
+    if (outOfRangeFaces > 0) report << "- 如果使用单张贴图，建议将 UV 归一到 0-1；如果使用 UDIM，可选择“UDIM拆分”。";
+    if (crossTileFaces > 0) report << "- 跨 UDIM 面会被按面中心归类，建议切分跨 tile 面以获得稳定输出。";
+    if (meshesWithoutUv == 0 && zeroUvAreaFaces == 0 && invalidFaces == 0) report << "- 当前 UV 数据适合继续进行 AO 贴图烘焙。";
+
+    const QString reportText = report.join("\n");
+    QDialog dialog(this);
+    dialog.setWindowTitle("UV 检查器");
+    dialog.resize(780, 560);
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* text = new QPlainTextEdit(reportText, &dialog);
+    text->setReadOnly(true);
+    layout->addWidget(text, 1);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText("关闭");
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    layout->addWidget(buttons);
+    log(QString("UV 检查完成：%1，错误 %2，警告 %3").arg(severityText(warningCount, errorCount)).arg(errorCount).arg(warningCount));
+    dialog.exec();
+}
+
+void MainWindow::exportLog() {
+    const QString path = QFileDialog::getSaveFileName(this, "导出日志", m_outputDir + "/AO_Baker_Pro_Log_" + QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss") + ".txt", "Text Log (*.txt)");
+    if (path.isEmpty()) return;
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+        QMessageBox::critical(this, "导出日志失败", "无法写入日志文件，请检查输出目录权限。");
+        return;
+    }
+    file.write((m_log ? m_log->toPlainText() : QString()).toUtf8());
+    file.close();
+    addRecentFile(path);
+    log("日志已导出：" + path);
+}
+
+void MainWindow::clearLog() {
+    if (m_log) m_log->clear();
+    statusBar()->showMessage("日志已清空", 3000);
+    updateStatusSummary();
 }
 
 void MainWindow::log(const QString& text) {
@@ -1483,7 +2182,8 @@ void MainWindow::markDirty(bool dirty) {
 }
 
 void MainWindow::updateWindowTitle() {
-    QString title = QString("AO_Baker_Pro_V2 - %1").arg(projectBaseName());
+    const QString version = QCoreApplication::applicationVersion().isEmpty() ? QStringLiteral("1.0.0") : QCoreApplication::applicationVersion();
+    QString title = QString("AO_Baker_Pro_V2 v%1 - %2").arg(version, projectBaseName());
     if (m_isDirty) title += " *";
     setWindowTitle(title);
 }
@@ -1512,8 +2212,10 @@ QString MainWindow::projectBaseName() const {
 
 void MainWindow::updateStatusSummary() {
     if (!m_statusSummary) return;
-    const QString summary = QString("状态：%1 | 顶点：%2 | 三角面：%3 | UV Mesh：%4 | 选中 Mesh：%5 | 输出：%6")
-        .arg(m_isDirty ? "未保存" : "已保存")
+    const QString summary = QString("软件：AO_Baker_Pro_V2 v%1 | 项目：%2 | 状态：%3 | 顶点：%4 | 三角面：%5 | UV Mesh：%6 | 选中 Mesh：%7 | 输出：%8")
+        .arg(QCoreApplication::applicationVersion().isEmpty() ? QStringLiteral("1.0.0") : QCoreApplication::applicationVersion())
+        .arg(projectBaseName())
+        .arg(m_isDirty ? "未保存 *" : "已保存")
         .arg(m_scene.vertexCount())
         .arg(m_scene.faceCount())
         .arg(m_scene.uvMeshCount())
@@ -1581,12 +2283,18 @@ void MainWindow::loadAppSettings() {
     m_settings.textureFormat = settings.value("output/format", m_settings.textureFormat).toString();
     m_settings.textureBitDepth = settings.value("output/bitDepth", m_settings.textureBitDepth).toString();
     m_settings.textureSplitMode = settings.value("output/splitMode", m_settings.textureSplitMode).toString();
+    m_settings.vertexColorWriteMode = settings.value("bake/vertexColorWriteMode", m_settings.vertexColorWriteMode).toString();
+    m_settings.bakeScope = settings.value("bake/scope", m_settings.bakeScope).toString();
+    m_settings.autoOpenOutputDir = settings.value("output/autoOpenOutputDir", m_settings.autoOpenOutputDir).toBool();
 
     if (m_outputLabel) m_outputLabel->setText(m_outputDir);
     if (m_resolution) m_resolution->setCurrentText(QString::number(m_settings.textureResolution));
     if (m_format) m_format->setCurrentText(m_settings.textureFormat);
     if (m_bitDepth) m_bitDepth->setCurrentText(m_settings.textureBitDepth);
     if (m_splitMode) m_splitMode->setCurrentText(m_settings.textureSplitMode);
+    if (m_vertexWriteMode) m_vertexWriteMode->setCurrentText(m_settings.vertexColorWriteMode);
+    if (m_bakeScope) m_bakeScope->setCurrentText(m_settings.bakeScope);
+    if (m_autoOpenOutputDir) m_autoOpenOutputDir->setChecked(m_settings.autoOpenOutputDir);
     updateOutputFormatUi();
     if (m_viewport) {
         m_viewport->setBakeSettings(m_settings);
@@ -1625,6 +2333,9 @@ void MainWindow::saveAppSettings() const {
     settings.setValue("output/format", m_settings.textureFormat);
     settings.setValue("output/bitDepth", m_settings.textureBitDepth);
     settings.setValue("output/splitMode", m_settings.textureSplitMode);
+    settings.setValue("bake/vertexColorWriteMode", m_settings.vertexColorWriteMode);
+    settings.setValue("bake/scope", m_settings.bakeScope);
+    settings.setValue("output/autoOpenOutputDir", m_settings.autoOpenOutputDir);
     if (m_viewport) settings.setValue("viewport/state", m_viewport->saveViewState());
     const QString autoRecoverPath = settingsDir() + "/autosave_recovery.aobproj";
     QFile file(autoRecoverPath);
@@ -1670,11 +2381,28 @@ bool MainWindow::loadProjectFromFile(const QString& path) {
 
 QJsonObject MainWindow::saveProjectJson() const {
     QJsonObject root;
-    root["version"] = 2;
+    root["format"] = QStringLiteral("AO_Baker_Pro_V2 Project");
+    root["projectExtension"] = QStringLiteral(".aobproj");
+    root["version"] = 3;
+    root["application"] = QStringLiteral("AO_Baker_Pro_V2");
+    root["applicationVersion"] = QCoreApplication::applicationVersion();
+    root["savedAt"] = QDateTime::currentDateTime().toString(Qt::ISODate);
     root["sourcePath"] = m_scene.sourcePath;
     root["outputDir"] = m_outputDir;
     root["outputName"] = m_outputNameEdit ? m_outputNameEdit->text() : QString();
     root["lastBakeCachePath"] = m_lastBakeCachePath;
+    root["recentBakeCachePath"] = m_lastBakeCachePath;
+    root["includeLog"] = true;
+    root["logText"] = m_log ? m_log->toPlainText() : QString();
+    if (m_rootSplitter) {
+        QJsonArray splitterSizes;
+        for (int size : m_rootSplitter->sizes()) splitterSizes.append(size);
+        QJsonObject layoutObj;
+        layoutObj["mainSplitterSizes"] = splitterSizes;
+        layoutObj["windowGeometryBase64"] = QString::fromLatin1(saveGeometry().toBase64());
+        layoutObj["windowStateBase64"] = QString::fromLatin1(saveState().toBase64());
+        root["panelLayout"] = layoutObj;
+    }
 
     QJsonObject settingsObj;
     settingsObj["aoStrength"] = m_settings.aoStrength;
@@ -1691,15 +2419,45 @@ QJsonObject MainWindow::saveProjectJson() const {
     settingsObj["textureFormat"] = m_settings.textureFormat;
     settingsObj["textureBitDepth"] = m_settings.textureBitDepth;
     settingsObj["textureSplitMode"] = m_settings.textureSplitMode;
+    settingsObj["vertexColorChannels"] = m_settings.vertexColorChannels;
+    settingsObj["vertexColorWriteMode"] = m_settings.vertexColorWriteMode;
+    settingsObj["bakeScope"] = m_settings.bakeScope;
+    settingsObj["autoOpenOutputDir"] = m_settings.autoOpenOutputDir;
     settingsObj["keepSmoothingGroups"] = m_settings.keepSmoothingGroups;
     settingsObj["keepUVs"] = m_settings.keepUVs;
     settingsObj["adaptiveSampling"] = m_settings.adaptiveSampling;
     root["bakeSettings"] = settingsObj;
+    root["aoSettings"] = settingsObj;
 
-    if (m_viewport) root["viewportState"] = m_viewport->saveViewState();
+    QJsonObject outputSettings;
+    outputSettings["outputDir"] = m_outputDir;
+    outputSettings["outputName"] = m_outputNameEdit ? m_outputNameEdit->text() : QString();
+    outputSettings["textureResolution"] = m_settings.textureResolution;
+    outputSettings["textureFormat"] = m_settings.textureFormat;
+    outputSettings["textureBitDepth"] = m_settings.textureBitDepth;
+    outputSettings["textureSplitMode"] = m_settings.textureSplitMode;
+    outputSettings["autoOpenOutputDir"] = m_settings.autoOpenOutputDir;
+    root["outputSettings"] = outputSettings;
 
+    if (m_viewport) {
+        const QJsonObject viewportState = m_viewport->saveViewState();
+        root["viewportState"] = viewportState;
+        root["brushSettings"] = viewportState.value("brushSettings").toObject();
+    }
+
+    QJsonArray sceneHierarchy;
     QJsonArray meshes;
     for (const auto& mesh : m_scene.meshes) {
+        QJsonObject hierarchyItem;
+        hierarchyItem["name"] = mesh.name;
+        hierarchyItem["type"] = QStringLiteral("mesh");
+        hierarchyItem["vertexCount"] = mesh.vertices.size();
+        hierarchyItem["faceCount"] = mesh.faces.size();
+        hierarchyItem["hasUV"] = mesh.hasUV;
+        hierarchyItem["hasNormals"] = mesh.hasNormals;
+        hierarchyItem["hasVertexColor"] = mesh.hasVertexColor;
+        sceneHierarchy.append(hierarchyItem);
+
         QJsonObject meshObj;
         meshObj["name"] = mesh.name;
         meshObj["hasUV"] = mesh.hasUV;
@@ -1727,7 +2485,9 @@ QJsonObject MainWindow::saveProjectJson() const {
         meshObj["faces"] = faces;
         meshes.append(meshObj);
     }
+    root["sceneHierarchy"] = sceneHierarchy;
     root["meshes"] = meshes;
+    root["vertexColorData"] = meshes;
     return root;
 }
 
@@ -1767,7 +2527,7 @@ bool MainWindow::restoreProjectJson(const QJsonObject& root) {
         loadedScene.meshes.push_back(mesh);
     }
 
-    const QJsonObject settingsObj = root.value("bakeSettings").toObject();
+    const QJsonObject settingsObj = root.value("bakeSettings").toObject(root.value("aoSettings").toObject());
     if (!settingsObj.isEmpty()) {
         m_settings.aoStrength = float(settingsObj.value("aoStrength").toDouble(m_settings.aoStrength));
         m_settings.groundBounceStrength = float(settingsObj.value("groundBounceStrength").toDouble(m_settings.groundBounceStrength));
@@ -1783,22 +2543,47 @@ bool MainWindow::restoreProjectJson(const QJsonObject& root) {
         m_settings.textureFormat = settingsObj.value("textureFormat").toString(m_settings.textureFormat);
         m_settings.textureBitDepth = settingsObj.value("textureBitDepth").toString(m_settings.textureBitDepth);
         m_settings.textureSplitMode = settingsObj.value("textureSplitMode").toString(m_settings.textureSplitMode);
+        m_settings.vertexColorChannels = settingsObj.value("vertexColorChannels").toString(m_settings.vertexColorChannels);
+        m_settings.vertexColorWriteMode = settingsObj.value("vertexColorWriteMode").toString(m_settings.vertexColorWriteMode);
+        m_settings.bakeScope = settingsObj.value("bakeScope").toString(m_settings.bakeScope);
+        m_settings.autoOpenOutputDir = settingsObj.value("autoOpenOutputDir").toBool(m_settings.autoOpenOutputDir);
         m_settings.keepSmoothingGroups = settingsObj.value("keepSmoothingGroups").toBool(m_settings.keepSmoothingGroups);
         m_settings.keepUVs = settingsObj.value("keepUVs").toBool(m_settings.keepUVs);
         m_settings.adaptiveSampling = settingsObj.value("adaptiveSampling").toBool(m_settings.adaptiveSampling);
     }
 
     m_scene = loadedScene;
-    m_outputDir = root.value("outputDir").toString(m_outputDir);
-    m_lastBakeCachePath = root.value("lastBakeCachePath").toString();
-    if (m_outputNameEdit) m_outputNameEdit->setText(root.value("outputName").toString());
+    const QJsonObject outputSettings = root.value("outputSettings").toObject();
+    m_outputDir = outputSettings.value("outputDir").toString(root.value("outputDir").toString(m_outputDir));
+    m_lastBakeCachePath = root.value("lastBakeCachePath").toString(root.value("recentBakeCachePath").toString());
+    if (m_outputNameEdit) m_outputNameEdit->setText(outputSettings.value("outputName").toString(root.value("outputName").toString()));
     if (m_outputLabel) m_outputLabel->setText(m_outputDir);
     if (m_resolution) m_resolution->setCurrentText(QString::number(m_settings.textureResolution));
     if (m_format) m_format->setCurrentText(m_settings.textureFormat);
     if (m_bitDepth) m_bitDepth->setCurrentText(m_settings.textureBitDepth);
     if (m_splitMode) m_splitMode->setCurrentText(m_settings.textureSplitMode);
+    if (m_vertexWriteMode) m_vertexWriteMode->setCurrentText(m_settings.vertexColorWriteMode);
+    if (m_bakeScope) m_bakeScope->setCurrentText(m_settings.bakeScope);
+    if (m_autoOpenOutputDir) m_autoOpenOutputDir->setChecked(m_settings.autoOpenOutputDir);
     updateOutputFormatUi();
     if (m_colorButton) m_colorButton->setText(m_settings.groundBounceColor.name());
+    const QJsonObject layoutObj = root.value("panelLayout").toObject();
+    if (m_rootSplitter) {
+        const QJsonArray splitterSizes = layoutObj.value("mainSplitterSizes").toArray();
+        if (!splitterSizes.isEmpty()) {
+            QList<int> sizes;
+            for (const auto& sizeValue : splitterSizes) sizes.append(sizeValue.toInt());
+            m_rootSplitter->setSizes(sizes);
+        }
+    }
+    const QByteArray geometry = QByteArray::fromBase64(layoutObj.value("windowGeometryBase64").toString().toLatin1());
+    if (!geometry.isEmpty()) restoreGeometry(geometry);
+    const QByteArray windowState = QByteArray::fromBase64(layoutObj.value("windowStateBase64").toString().toLatin1());
+    if (!windowState.isEmpty()) restoreState(windowState);
+    if (m_log && root.value("includeLog").toBool(false)) {
+        const QString logText = root.value("logText").toString();
+        if (!logText.isEmpty()) m_log->setPlainText(logText);
+    }
     if (m_viewport) {
         m_viewport->setScene(&m_scene);
         m_viewport->setBakeSettings(m_settings);
