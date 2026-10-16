@@ -12,6 +12,7 @@ struct Vertex {
     QVector3D normal;
     QVector2D uv;
     QColor color = QColor(255, 255, 255, 255);
+    float bakedAO = 1.0f;
     int originalIndex = -1;
 };
 
@@ -30,6 +31,7 @@ struct MeshData {
     bool hasUV = false;
     bool hasNormals = false;
     bool hasVertexColor = false;
+    bool visible = true;
 };
 
 struct SceneData {
@@ -66,4 +68,9 @@ struct BakeSettings {
     bool keepSmoothingGroups = true;
     bool keepUVs = true;
     bool adaptiveSampling = true;
+    QString accelerationMode = "自动";
+    bool multiThreadedBake = true;
+    int bakeBlockSize = 512;
+    bool cacheAccelerationStructure = true;
+    bool gpuComputePreview = false;
 };

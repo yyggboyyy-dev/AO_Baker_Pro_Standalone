@@ -3,6 +3,7 @@
 #include "TextureRasterizer.h"
 
 #include <QApplication>
+#include <QBuffer>
 #include <QCheckBox>
 #include <QClipboard>
 #include <QCloseEvent>
@@ -18,6 +19,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHash>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -26,11 +28,13 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPair>
 #include <QProgressDialog>
 #include <QRadioButton>
 #include <QButtonGroup>
 #include <QGuiApplication>
 #include <QInputDialog>
+#include <QKeyEvent>
 #include <QList>
 #include <QMap>
 #include <QPlainTextEdit>
@@ -44,11 +48,17 @@
 #include <QTabWidget>
 #include <QTimer>
 #include <QHeaderView>
+#include <QImage>
+#include <QLinearGradient>
+#include <QPainter>
+#include <QPixmap>
+#include <QRadialGradient>
 #include <QToolBar>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QAction>
 #include <QAbstractItemView>
+#include <QBrush>
 #include <QLibrary>
 #include <QOperatingSystemVersion>
 #include <QVariant>
@@ -197,6 +207,18 @@ float triangleArea3D(const QVector3D& a, const QVector3D& b, const QVector3D& c)
     return QVector3D::crossProduct(b - a, c - a).length() * 0.5f;
 }
 
+QString vertexKey(const QVector3D& p, float scale = 100000.0f) {
+    return QStringLiteral("%1|%2|%3")
+        .arg(qRound64(p.x() * scale))
+        .arg(qRound64(p.y() * scale))
+        .arg(qRound64(p.z() * scale));
+}
+
+QString edgeKey(int a, int b) {
+    if (a > b) std::swap(a, b);
+    return QStringLiteral("%1|%2").arg(a).arg(b);
+}
+
 float triangleAreaUv(const QVector2D& a, const QVector2D& b, const QVector2D& c) {
     const QVector2D ab = b - a;
     const QVector2D ac = c - a;
@@ -315,6 +337,17 @@ SceneData buildSceneForSelectedMesh(const SceneData& scene, int selectedMeshInde
     }
     return filteredScene;
 }
+
+SceneData buildSceneForVisibleMeshes(const SceneData& scene) {
+    SceneData filteredScene;
+    filteredScene.sourcePath = scene.sourcePath;
+    for (const auto& mesh : scene.meshes) {
+        if (mesh.visible) {
+            filteredScene.meshes.push_back(mesh);
+        }
+    }
+    return filteredScene;
+}
 }
 
 SliderRow::SliderRow(float min, float max, float value, int decimals, QWidget* parent)
@@ -391,8 +424,8 @@ QWidget* MainWindow::group(const QString& title, QWidget* child) {
 void MainWindow::buildMenus() {
     auto* fileMenu = menuBar()->addMenu("文件(&F)");
     fileMenu->addAction("新建场景", this, &MainWindow::newScene, QKeySequence::New);
-    fileMenu->addAction("打开项目", this, &MainWindow::loadProject, QKeySequence::Open);
-    fileMenu->addAction("打开", this, &MainWindow::importModel);
+    fileMenu->addAction("打开项目", this, &MainWindow::loadProject);
+    fileMenu->addAction("打开", this, &MainWindow::importModel, QKeySequence(QStringLiteral("Ctrl+O")));
     fileMenu->addAction("导入", this, &MainWindow::importModel);
 
     m_recentFilesMenu = fileMenu->addMenu("最近打开");
@@ -401,7 +434,7 @@ void MainWindow::buildMenus() {
     fileMenu->addSeparator();
     fileMenu->addAction("保存项目", this, &MainWindow::saveProject, QKeySequence::Save);
     fileMenu->addAction("另存为项目", this, &MainWindow::saveProjectAs, QKeySequence::SaveAs);
-    fileMenu->addAction("导出当前模型", this, &MainWindow::exportCurrentModel);
+    fileMenu->addAction("导出当前模型", this, &MainWindow::exportCurrentModel, QKeySequence(QStringLiteral("Ctrl+E")));
     fileMenu->addAction("保存", this, &MainWindow::exportCurrentModel);
     fileMenu->addAction("导出", this, &MainWindow::exportCurrentModel);
     fileMenu->addAction("导出 AO 贴图", this, &MainWindow::bakeTexture);
@@ -412,20 +445,22 @@ void MainWindow::buildMenus() {
 
     auto* editMenu = menuBar()->addMenu("编辑(&E)");
     m_undoAction = editMenu->addAction("撤销", this, &MainWindow::undoActionTriggered, QKeySequence::Undo);
-    m_redoAction = editMenu->addAction("重做", this, &MainWindow::redoActionTriggered, QKeySequence::Redo);
+    m_redoAction = editMenu->addAction("重做", this, &MainWindow::redoActionTriggered);
+    m_redoAction->setShortcuts({QKeySequence(QStringLiteral("Ctrl+Y")), QKeySequence(QStringLiteral("Ctrl+Shift+Z"))});
     m_undoAction->setEnabled(false);
     m_redoAction->setEnabled(false);
     editMenu->addSeparator();
     editMenu->addAction("软件设置", this, &MainWindow::openPreferences);
     auto* perfMenu = editMenu->addMenu("软件性能模式选项");
-    perfMenu->addAction("高质量模式", this, [this](){ m_settings.sampleCount = 512; m_settings.adaptiveSampling = false; onSettingsChanged(); log("已切换到高质量模式：512 射线，关闭自适应采样。"); });
-    perfMenu->addAction("平衡模式", this, [this](){ m_settings.sampleCount = 256; m_settings.adaptiveSampling = true; onSettingsChanged(); log("已切换到平衡模式：256 射线，自适应采样。"); });
-    perfMenu->addAction("快速模式", this, [this](){ m_settings.sampleCount = 96; m_settings.adaptiveSampling = true; onSettingsChanged(); log("已切换到快速模式：96 射线，自适应采样。"); });
+    perfMenu->addAction("高质量模式", this, [this](){ m_settings.sampleCount = 512; m_settings.adaptiveSampling = false; m_settings.accelerationMode = QStringLiteral("Embree 类 CPU"); m_settings.multiThreadedBake = true; m_settings.bakeBlockSize = 512; onSettingsChanged(); log("已切换到高质量模式：512 射线，Embree 类 CPU 遍历，多线程分块。"); });
+    perfMenu->addAction("平衡模式", this, [this](){ m_settings.sampleCount = 256; m_settings.adaptiveSampling = true; m_settings.accelerationMode = QStringLiteral("自动"); m_settings.multiThreadedBake = true; m_settings.bakeBlockSize = 512; onSettingsChanged(); log("已切换到平衡模式：256 射线，自动加速结构，自适应采样。"); });
+    perfMenu->addAction("快速模式", this, [this](){ m_settings.sampleCount = 96; m_settings.adaptiveSampling = true; m_settings.accelerationMode = QStringLiteral("BVH"); m_settings.multiThreadedBake = true; m_settings.bakeBlockSize = 1024; onSettingsChanged(); log("已切换到快速模式：96 射线，BVH，多线程大分块。"); });
     editMenu->addAction("清除顶点色", this, &MainWindow::clearVertexColors);
     editMenu->addAction("重新载入刷新模型", this, [this](){
         if (m_scene.sourcePath.isEmpty()) { QMessageBox::warning(this, "缺少模型", "当前没有可重新载入的模型路径。"); return; }
         try {
             m_scene = ModelIO::importModel(m_scene.sourcePath);
+            for (auto& mesh : m_scene.meshes) mesh.visible = true;
             refreshSceneInfo();
             if (m_viewport) { m_viewport->setScene(&m_scene); m_viewport->setBakeSettings(m_settings); }
             markDirty();
@@ -471,6 +506,7 @@ void MainWindow::buildMenus() {
         addPanelToggle("显示 / 隐藏日志", m_logGroup);
         addPanelToggle("显示 / 隐藏 AO 设置", m_aoSettingsGroup);
         addPanelToggle("显示 / 隐藏预览", m_previewGroup);
+        addPanelToggle("显示 / 隐藏右下预览模块", m_previewPanelGroup);
         panelMenu->addSeparator();
         panelMenu->addAction("重置布局", this, &MainWindow::resetPanelLayout);
         panelMenu->addAction("保存布局", this, &MainWindow::savePanelLayout);
@@ -498,11 +534,35 @@ void MainWindow::buildMenus() {
     toolMenu->addAction("笔刷相关的详细设置", this, [this](){ QMessageBox::information(this, "笔刷详细设置", "已支持画笔 / 擦除 / 填充桶、半径、不透明度、软笔刷、忽略背面、锁定通道、图层不透明度。高级笔刷曲线和压力感应接口已预留。"); });
     toolMenu->addAction("颜色填充模式详细设置", this, [this](){ if (m_viewport) m_viewport->setPaintMode(2); QMessageBox::information(this, "颜色填充模式", "已切换到填充桶模式。可在左侧顶点色绘制面板选择颜色、混合模式和图层不透明度。"); });
     toolMenu->addAction("UV集的详细选择和设置", this, [this](){ QMessageBox::information(this, "UV 集设置", "当前保留导入模型的 UV0。UV1/多 UV 集选择、复制、重命名和导出映射设置已预留。"); });
-    toolMenu->addAction("法线 / 光滑组工具", this, &MainWindow::unifySmoothingGroups);
+    auto* normalMenu = toolMenu->addMenu("法线 / 光滑组工具");
+    normalMenu->addAction("检测光滑组", this, &MainWindow::runModelChecker);
+    normalMenu->addAction("重新计算法线 / 合并法线", this, [this](){
+        if (m_scene.empty()) { QMessageBox::warning(this, "缺少模型", "请先导入模型。"); return; }
+        recalculateNormals(false);
+        if (m_viewport) { m_viewport->setScene(&m_scene); m_viewport->setBakeSettings(m_settings); }
+        refreshSceneInfo();
+        markDirty();
+        log("已重新计算法线并合并为平滑顶点法线。");
+        QMessageBox::information(this, "法线完成", "已重新计算法线，并按共享顶点合并法线。硬边数据仍通过光滑组标记保留。");
+    });
+    normalMenu->addAction("一键全部生成软边 / 统一光滑组", this, &MainWindow::unifySmoothingGroups);
+    normalMenu->addAction("分离法线 / 生成硬边", this, [this](){
+        if (m_scene.empty()) { QMessageBox::warning(this, "缺少模型", "请先导入模型。"); return; }
+        recalculateNormals(true);
+        for (auto& mesh : m_scene.meshes) {
+            for (auto& face : mesh.faces) face.smoothingMask = 0;
+        }
+        if (m_viewport) { m_viewport->setScene(&m_scene); m_viewport->setBakeSettings(m_settings); }
+        refreshSceneInfo();
+        markDirty();
+        log("已分离法线：按面拆分顶点并生成硬边法线。");
+        QMessageBox::information(this, "分离法线完成", "已按面拆分顶点并生成硬边法线，适合保留锐利边界。");
+    });
+    normalMenu->addAction("模型多边形面朝向一键修改到正确方向", this, &MainWindow::repairFaceOrientation);
 
     auto* helpMenu = menuBar()->addMenu("帮助(&H)");
     helpMenu->addAction("用户手册", this, [this](){ QMessageBox::information(this, "用户手册", "AO_Baker_Pro_V2 开发文档需求已接入当前版本，后续可继续补充正式在线手册。 "); });
-    helpMenu->addAction("快捷键列表", this, [this](){ QMessageBox::information(this, "快捷键", "F：聚焦模型\nCtrl+Z：撤销\nCtrl+Shift+Z / Ctrl+Y：重做\nAlt+左键：旋转\nAlt+中键：平移\nAlt+右键 / 滚轮：缩放"); });
+    helpMenu->addAction("快捷键列表", this, [this](){ QMessageBox::information(this, "快捷键", "Ctrl+O：导入模型\nCtrl+S：保存项目\nCtrl+Shift+S：另存为项目\nCtrl+E：导出模型\nCtrl+Z：撤销\nCtrl+Y / Ctrl+Shift+Z：重做\nF：聚焦模型\nB：切换笔刷 / 绘制\nE：橡皮擦\nG：显示 / 隐藏网格\nW：线框显示\n1/2/3/4：切换 R/G/B/RGB 通道\nQ：恢复选择模式\nSpace：预览切换\nAlt+左键：旋转\nAlt+中键：平移\nAlt+右键 / 滚轮：缩放"); });
     helpMenu->addAction("软件版本", this, [this](){ QMessageBox::information(this, "软件版本", QString("AO Baker Pro V2\n版本：%1").arg(QCoreApplication::applicationVersion())); });
     helpMenu->addAction("软件更新网址路径", this, [this](){ QMessageBox::information(this, "软件更新", "更新网址暂未配置。后续可填写 GitHub Release / 官网下载路径。"); });
     helpMenu->addAction("邮箱信息和联系方式", this, [this](){ QMessageBox::information(this, "联系方式", "邮箱和技术支持联系方式暂未配置，当前为占位信息。"); });
@@ -539,7 +599,40 @@ void MainWindow::buildUi() {
     auto* leftLayout = new QVBoxLayout(left);
     leftLayout->setContentsMargins(4, 4, 4, 4);
     m_tree = new QTreeWidget(this);
-    m_tree->setHeaderLabel("模型");
+    m_tree->setHeaderLabels({"模型层级", "状态", "顶点", "材质", "显示"});
+    m_tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_tree->setEditTriggers(QAbstractItemView::EditKeyPressed | QAbstractItemView::SelectedClicked);
+    auto* treeSearch = new QLineEdit(this);
+    treeSearch->setPlaceholderText("搜索 Mesh / 节点");
+    connect(treeSearch, &QLineEdit::textChanged, this, [this](const QString& text){
+        if (!m_tree) return;
+        const QString key = text.trimmed();
+        for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* root = m_tree->topLevelItem(i);
+            bool rootMatch = key.isEmpty() || root->text(0).contains(key, Qt::CaseInsensitive);
+            bool anyChildVisible = false;
+            for (int j = 0; root && j < root->childCount(); ++j) {
+                QTreeWidgetItem* node = root->child(j);
+                const bool match = key.isEmpty() || node->text(0).contains(key, Qt::CaseInsensitive) || node->text(1).contains(key, Qt::CaseInsensitive);
+                node->setHidden(!match);
+                anyChildVisible = anyChildVisible || match;
+            }
+            root->setHidden(!rootMatch && !anyChildVisible);
+            if (!key.isEmpty()) root->setExpanded(true);
+        }
+    });
+    connect(m_tree, &QTreeWidget::customContextMenuRequested, this, &MainWindow::showMeshContextMenu);
+    connect(m_tree, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem* item, int column){
+        if (!item || column != 4 || !m_viewport) return;
+        const int meshIndex = item->data(0, Qt::UserRole).toInt();
+        if (meshIndex < 0 || meshIndex >= m_scene.meshes.size()) return;
+        const bool visible = item->checkState(4) == Qt::Checked;
+        m_viewport->setMeshVisible(meshIndex, visible);
+        m_scene.meshes[meshIndex].visible = visible;
+        item->setText(4, visible ? "显示" : "隐藏");
+        markDirty();
+    });
     connect(m_tree, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem* item, int){
         if (!item || !m_viewport) return;
         const int meshIndex = item->data(0, Qt::UserRole).toInt();
@@ -566,7 +659,12 @@ void MainWindow::buildUi() {
     logButtonLayout->addWidget(clearLogBtn);
     logLayout->addWidget(m_log, 1);
     logLayout->addWidget(logButtons);
-    m_modelTreeGroup = qobject_cast<QGroupBox*>(group("模型", m_tree));
+    auto* treePanel = new QWidget(this);
+    auto* treePanelLayout = new QVBoxLayout(treePanel);
+    treePanelLayout->setContentsMargins(0, 0, 0, 0);
+    treePanelLayout->addWidget(treeSearch);
+    treePanelLayout->addWidget(m_tree, 1);
+    m_modelTreeGroup = qobject_cast<QGroupBox*>(group("模型", treePanel));
     m_modelInfoGroup = qobject_cast<QGroupBox*>(group("模型信息", m_modelInfo));
     m_uvGroup = qobject_cast<QGroupBox*>(group("UV 通道", m_uvInfo));
     m_logGroup = qobject_cast<QGroupBox*>(group("日志", logPanel));
@@ -604,8 +702,10 @@ void MainWindow::buildUi() {
     auto* rightLayout = new QVBoxLayout(right);
     m_aoSettingsGroup = qobject_cast<QGroupBox*>(buildSettingsPanel());
     m_outputGroup = qobject_cast<QGroupBox*>(buildOutputPanel());
+    m_previewPanelGroup = qobject_cast<QGroupBox*>(buildPreviewPanel());
     rightLayout->addWidget(m_aoSettingsGroup, 5);
     rightLayout->addWidget(m_outputGroup, 2);
+    rightLayout->addWidget(m_previewPanelGroup, 2);
 
     root->addWidget(paintColumn);
     root->addWidget(left);
@@ -616,6 +716,61 @@ void MainWindow::buildUi() {
     m_statusSummary = new QLabel(this);
     statusBar()->addPermanentWidget(m_statusSummary, 1);
     statusBar()->showMessage("就绪");
+}
+
+
+void MainWindow::keyPressEvent(QKeyEvent* event) {
+    if (!event) return;
+    if (event->modifiers() == Qt::NoModifier) {
+        switch (event->key()) {
+        case Qt::Key_F:
+            if (m_viewport) m_viewport->focusModel();
+            log("快捷键 F：聚焦模型。");
+            event->accept();
+            return;
+        case Qt::Key_B:
+            if (m_viewport) m_viewport->toggleVertexPaintEnabled();
+            log("快捷键 B：切换笔刷 / 绘制模式。");
+            event->accept();
+            return;
+        case Qt::Key_E:
+            if (m_viewport) m_viewport->togglePaintEraseMode();
+            log("快捷键 E：切换橡皮擦。");
+            event->accept();
+            return;
+        case Qt::Key_G:
+            if (m_viewport) m_viewport->toggleGridVisible();
+            log("快捷键 G：显示 / 隐藏网格。");
+            event->accept();
+            return;
+        case Qt::Key_W:
+            if (m_viewport) m_viewport->toggleWireframeVisible();
+            log("快捷键 W：线框显示开关。");
+            event->accept();
+            return;
+        case Qt::Key_1:
+        case Qt::Key_2:
+        case Qt::Key_3:
+        case Qt::Key_4:
+            if (m_viewport) m_viewport->setVisibleChannelPreset(event->key() - Qt::Key_1);
+            log(QString("快捷键 %1：切换顶点色通道。").arg(event->key() - Qt::Key_0));
+            event->accept();
+            return;
+        case Qt::Key_Q:
+            if (m_viewport) m_viewport->restoreSelectionMode();
+            log("快捷键 Q：恢复选择模式。");
+            event->accept();
+            return;
+        case Qt::Key_Space:
+            if (m_viewport) m_viewport->toggleRealtimePreview();
+            log("快捷键 Space：预览切换。");
+            event->accept();
+            return;
+        default:
+            break;
+        }
+    }
+    QMainWindow::keyPressEvent(event);
 }
 
 QWidget* MainWindow::buildSettingsPanel() {
@@ -648,21 +803,31 @@ QWidget* MainWindow::buildSettingsPanel() {
     form->addRow("射线数量", samples);
     addSlider("最大烘焙距离", 0.1f, 100, m_settings.rayDistance, [this](float v){ m_settings.rayDistance = v; onSettingsChanged(); });
     addSlider("细节保留", 0, 1, m_settings.detailPreserve, [this](float v){ m_settings.detailPreserve = v; onSettingsChanged(); });
-    auto* keepSmooth = new QCheckBox("保留光滑组 / 软硬边", this);
+    auto* keepSmooth = new QPushButton("保留光滑组 / 软硬边", this);
+    keepSmooth->setCheckable(true);
     keepSmooth->setChecked(true);
-    connect(keepSmooth, &QCheckBox::toggled, this, [this](bool v){ m_settings.keepSmoothingGroups = v; onSettingsChanged(); });
-    auto* keepUv = new QCheckBox("保留原始 UV 集和 UV 内容", this);
+    keepSmooth->setProperty("toolButton", true);
+    connect(keepSmooth, &QPushButton::toggled, this, [this](bool v){ m_settings.keepSmoothingGroups = v; onSettingsChanged(); });
+    auto* keepUv = new QPushButton("保留原始 UV 集和 UV 内容", this);
+    keepUv->setCheckable(true);
     keepUv->setChecked(true);
-    connect(keepUv, &QCheckBox::toggled, this, [this](bool v){ m_settings.keepUVs = v; onSettingsChanged(); });
-    auto* adaptive = new QCheckBox("自适应采样", this);
+    keepUv->setProperty("toolButton", true);
+    connect(keepUv, &QPushButton::toggled, this, [this](bool v){ m_settings.keepUVs = v; onSettingsChanged(); });
+    auto* adaptive = new QPushButton("自适应采样", this);
+    adaptive->setCheckable(true);
     adaptive->setChecked(true);
-    connect(adaptive, &QCheckBox::toggled, this, [this](bool v){ m_settings.adaptiveSampling = v; onSettingsChanged(); });
-    auto* wireframe = new QCheckBox("显示模型网格线框", this);
+    adaptive->setProperty("toolButton", true);
+    connect(adaptive, &QPushButton::toggled, this, [this](bool v){ m_settings.adaptiveSampling = v; onSettingsChanged(); });
+    auto* wireframe = new QPushButton("显示模型网格线框", this);
+    wireframe->setCheckable(true);
     wireframe->setChecked(true);
-    connect(wireframe, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setWireframeVisible(v); updateStatusSummary(); });
-    auto* useVertexColor = new QCheckBox("显示顶点色 / AO 结果", this);
+    wireframe->setProperty("toolButton", true);
+    connect(wireframe, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setWireframeVisible(v); updateStatusSummary(); });
+    auto* useVertexColor = new QPushButton("显示顶点色 / AO 结果", this);
+    useVertexColor->setCheckable(true);
     useVertexColor->setChecked(true);
-    connect(useVertexColor, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setUseVertexColor(v); updateStatusSummary(); });
+    useVertexColor->setProperty("toolButton", true);
+    connect(useVertexColor, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setUseVertexColor(v); updateStatusSummary(); });
     auto* materialRow = new QWidget(this);
     auto* materialLayout = new QHBoxLayout(materialRow);
     materialLayout->setContentsMargins(0,0,0,0);
@@ -686,15 +851,78 @@ QWidget* MainWindow::buildSettingsPanel() {
         onSettingsChanged();
     });
 
-    auto* vertexChannels = new QLabel("RGB", this);
-    vertexChannels->setStyleSheet("color:#9fb5d1; background:#151a20; border:1px solid #39424c; padding:4px;");
+    auto* channelRow = new QWidget(this);
+    auto* channelLayout = new QHBoxLayout(channelRow);
+    channelLayout->setContentsMargins(0, 0, 0, 0);
+    auto* rChan = new QPushButton("R", this);
+    auto* gChan = new QPushButton("G", this);
+    auto* bChan = new QPushButton("B", this);
+    auto* aChan = new QPushButton("A", this);
+    for (auto* btn : {rChan, gChan, bChan, aChan}) {
+        btn->setCheckable(true);
+        btn->setProperty("toolButton", true);
+        channelLayout->addWidget(btn);
+    }
+    const QString initialChannels = m_settings.vertexColorChannels.toUpper();
+    rChan->setChecked(initialChannels.contains(QStringLiteral("R")));
+    gChan->setChecked(initialChannels.contains(QStringLiteral("G")));
+    bChan->setChecked(initialChannels.contains(QStringLiteral("B")));
+    aChan->setChecked(initialChannels.contains(QStringLiteral("A")));
+    auto updateWriteChannels = [this, rChan, gChan, bChan, aChan]() {
+        QString channels;
+        if (rChan->isChecked()) channels += QStringLiteral("R");
+        if (gChan->isChecked()) channels += QStringLiteral("G");
+        if (bChan->isChecked()) channels += QStringLiteral("B");
+        if (aChan->isChecked()) channels += QStringLiteral("A");
+        if (channels.isEmpty()) {
+            rChan->setChecked(true);
+            channels = QStringLiteral("R");
+        }
+        m_settings.vertexColorChannels = channels;
+        onSettingsChanged();
+    };
+    connect(rChan, &QPushButton::toggled, this, [updateWriteChannels](bool){ updateWriteChannels(); });
+    connect(gChan, &QPushButton::toggled, this, [updateWriteChannels](bool){ updateWriteChannels(); });
+    connect(bChan, &QPushButton::toggled, this, [updateWriteChannels](bool){ updateWriteChannels(); });
+    connect(aChan, &QPushButton::toggled, this, [updateWriteChannels](bool){ updateWriteChannels(); });
+    auto* acceleration = new QComboBox(this);
+    acceleration->addItems({"自动", "BVH", "KD-Tree", "Embree 类 CPU", "GPU Compute 预留"});
+    acceleration->setCurrentText(m_settings.accelerationMode);
+    connect(acceleration, &QComboBox::currentTextChanged, this, [this](const QString& v){
+        m_settings.accelerationMode = v;
+        if (v == QStringLiteral("GPU Compute 预留")) {
+            m_settings.gpuComputePreview = true;
+            log("GPU Compute 已作为商业版扩展入口预留；当前版本仍使用 CPU 加速结构执行。 ");
+        }
+        onSettingsChanged();
+    });
+    auto* multiThread = new QPushButton("多线程烘焙", this);
+    multiThread->setCheckable(true);
+    multiThread->setChecked(m_settings.multiThreadedBake);
+    multiThread->setProperty("toolButton", true);
+    connect(multiThread, &QPushButton::toggled, this, [this](bool v){ m_settings.multiThreadedBake = v; onSettingsChanged(); });
+    auto* cacheAccel = new QPushButton("缓存加速结构", this);
+    cacheAccel->setCheckable(true);
+    cacheAccel->setChecked(m_settings.cacheAccelerationStructure);
+    cacheAccel->setProperty("toolButton", true);
+    connect(cacheAccel, &QPushButton::toggled, this, [this](bool v){ m_settings.cacheAccelerationStructure = v; onSettingsChanged(); });
+    auto* blockSize = new QSpinBox(this);
+    blockSize->setRange(64, 8192);
+    blockSize->setSingleStep(64);
+    blockSize->setValue(m_settings.bakeBlockSize);
+    connect(blockSize, &QSpinBox::valueChanged, this, [this](int v){ m_settings.bakeBlockSize = v; onSettingsChanged(); });
+
     form->addRow(keepSmooth);
     form->addRow(keepUv);
     form->addRow(adaptive);
+    form->addRow("加速结构", acceleration);
+    form->addRow(multiThread);
+    form->addRow(cacheAccel);
+    form->addRow("分块大小", blockSize);
     form->addRow(wireframe);
     form->addRow(useVertexColor);
     form->addRow("默认材质颜色", materialRow);
-    form->addRow("顶点色写入通道", vertexChannels);
+    form->addRow("顶点色写入通道", channelRow);
     form->addRow("顶点色写入方式", m_vertexWriteMode);
     form->addRow("烘焙范围", m_bakeScope);
     return box;
@@ -705,26 +933,37 @@ QWidget* MainWindow::buildVertexPaintPanel() {
     auto* form = new QFormLayout(box);
 
     auto* showChannel = new QComboBox(this);
-    showChannel->addItems({"顶点色", "AO结果", "默认材质"});
+    showChannel->addItems({"当前图层", "仅显示R", "仅显示G", "仅显示B", "仅显示A", "仅显示灰度", "彩色合成", "默认材质"});
+    showChannel->setCurrentText("彩色合成");
     connect(showChannel, &QComboBox::currentTextChanged, this, [this](const QString& text){
         if (!m_viewport) return;
         m_viewport->setUseVertexColor(text != "默认材质");
+        m_viewport->setDisplayChannelMode(text);
         updateStatusSummary();
     });
-    form->addRow("显示通道", showChannel);
+    form->addRow("显示", showChannel);
 
-    auto* paintEnabled = new QCheckBox("进入绘制模式 / 启用笔刷光标", this);
-    connect(paintEnabled, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setVertexPaintEnabled(v); updateStatusSummary(); });
+    auto* paintEnabled = new QPushButton("进入绘制模式 / 启用笔刷光标", this);
+    paintEnabled->setCheckable(true);
+    paintEnabled->setProperty("toolButton", true);
+    connect(paintEnabled, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setVertexPaintEnabled(v); updateStatusSummary(); });
     form->addRow(paintEnabled);
 
     auto* toolRow = new QWidget(this);
     auto* toolLayout = new QHBoxLayout(toolRow);
     toolLayout->setContentsMargins(0,0,0,0);
-    auto* brush = new QRadioButton("画笔", this);
-    auto* eraser = new QRadioButton("擦除", this);
-    auto* bucket = new QRadioButton("填充桶", this);
+    auto* brush = new QPushButton("画笔", this);
+    auto* eraser = new QPushButton("擦除", this);
+    auto* bucket = new QPushButton("填充桶", this);
+    brush->setCheckable(true);
+    eraser->setCheckable(true);
+    bucket->setCheckable(true);
+    brush->setProperty("toolButton", true);
+    eraser->setProperty("toolButton", true);
+    bucket->setProperty("toolButton", true);
     brush->setChecked(true);
     auto* toolGroup = new QButtonGroup(this);
+    toolGroup->setExclusive(true);
     toolGroup->addButton(brush, 0);
     toolGroup->addButton(eraser, 1);
     toolGroup->addButton(bucket, 2);
@@ -754,35 +993,45 @@ QWidget* MainWindow::buildVertexPaintPanel() {
     connect(size, &QSpinBox::valueChanged, this, [this](int v){ if (m_viewport) m_viewport->setPaintRadius(float(v)); markDirty(); });
     form->addRow("笔刷大小", size);
 
-    auto* soft = new QCheckBox("软笔刷 / 边缘衰减", this);
+    auto* soft = new QPushButton("软笔刷 / 边缘衰减", this);
+    soft->setCheckable(true);
     soft->setChecked(true);
-    connect(soft, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setPaintSoftBrush(v); markDirty(); });
+    soft->setProperty("toolButton", true);
+    connect(soft, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setPaintSoftBrush(v); markDirty(); });
     form->addRow("笔刷选项", soft);
 
     auto* hardness = new SliderRow(0, 1, 0.35f, 2, this);
     connect(hardness, &SliderRow::valueChanged, this, [this](float v){ if (m_viewport) m_viewport->setPaintHardness(v); markDirty(); });
     form->addRow("笔刷硬度", hardness);
 
-    auto* pressure = new QCheckBox("压力模拟（鼠标中心压力）", this);
-    connect(pressure, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setPressureSimulationEnabled(v); markDirty(); });
+    auto* pressure = new QPushButton("压力模拟（鼠标中心压力）", this);
+    pressure->setCheckable(true);
+    pressure->setProperty("toolButton", true);
+    connect(pressure, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setPressureSimulationEnabled(v); markDirty(); });
     form->addRow("压力模拟", pressure);
 
-    auto* mirror = new QCheckBox("镜像绘制（屏幕水平镜像）", this);
-    connect(mirror, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setMirrorPaintingEnabled(v); markDirty(); });
+    auto* mirror = new QPushButton("镜像绘制（屏幕水平镜像）", this);
+    mirror->setCheckable(true);
+    mirror->setProperty("toolButton", true);
+    connect(mirror, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setMirrorPaintingEnabled(v); markDirty(); });
     form->addRow("镜像绘制", mirror);
 
-    auto* normalFalloff = new QCheckBox("沿法线衰减", this);
+    auto* normalFalloff = new QPushButton("沿法线衰减", this);
+    normalFalloff->setCheckable(true);
     normalFalloff->setChecked(true);
-    connect(normalFalloff, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setNormalFalloffEnabled(v); markDirty(); });
+    normalFalloff->setProperty("toolButton", true);
+    connect(normalFalloff, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setNormalFalloffEnabled(v); markDirty(); });
     form->addRow("法线衰减", normalFalloff);
 
-    m_ignoreBackfacesCheck = new QCheckBox("绘制时忽略背面", this);
+    m_ignoreBackfacesCheck = new QPushButton("绘制时忽略背面", this);
+    m_ignoreBackfacesCheck->setCheckable(true);
     m_ignoreBackfacesCheck->setChecked(true);
-    connect(m_ignoreBackfacesCheck, &QCheckBox::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setIgnoreBackfaces(v); markDirty(); });
+    m_ignoreBackfacesCheck->setProperty("toolButton", true);
+    connect(m_ignoreBackfacesCheck, &QPushButton::toggled, this, [this](bool v){ if (m_viewport) m_viewport->setIgnoreBackfaces(v); markDirty(); });
     form->addRow("绘制限制", m_ignoreBackfacesCheck);
 
     auto* blend = new QComboBox(this);
-    blend->addItems({"正常", "正片叠底", "滤色", "叠加", "加亮", "变暗"});
+    blend->addItems({"正常", "相加", "相减", "正片叠底", "滤色", "覆盖", "变亮", "变暗", "最大值", "最小值"});
     connect(blend, &QComboBox::currentTextChanged, this, [this](const QString& v){ if (m_viewport) m_viewport->setPaintBlendMode(v); markDirty(); });
     form->addRow("混合模式", blend);
 
@@ -790,10 +1039,20 @@ QWidget* MainWindow::buildVertexPaintPanel() {
     auto* paletteLayout = new QHBoxLayout(paletteRow);
     paletteLayout->setContentsMargins(0,0,0,0);
     const QList<QColor> colors = {Qt::white, Qt::black, Qt::red, Qt::green, Qt::blue, Qt::yellow};
+    auto* paletteGroup = new QButtonGroup(this);
+    paletteGroup->setExclusive(true);
+    bool firstColor = true;
     for (const QColor& c : colors) {
         auto* b = new QPushButton(this);
+        b->setCheckable(true);
+        b->setProperty("colorChip", true);
         b->setFixedSize(24, 22);
-        b->setStyleSheet(QString("background:%1; border:1px solid #39424c;").arg(c.name()));
+        b->setStyleSheet(QString("QPushButton { background:%1; border:1px solid #39424c; padding:0; border-radius:4px; } QPushButton:checked { border:3px solid #ffffff; }").arg(c.name()));
+        paletteGroup->addButton(b);
+        if (firstColor) {
+            b->setChecked(true);
+            firstColor = false;
+        }
         connect(b, &QPushButton::clicked, this, [this, c](){
             if (m_paintColorButton) m_paintColorButton->setText(c.name());
             if (m_viewport) m_viewport->setPaintColor(c);
@@ -817,27 +1076,49 @@ QWidget* MainWindow::buildVertexPaintPanel() {
     connect(fillLayer, &QPushButton::clicked, this, [this](){ if (m_viewport) m_viewport->fillSelectedMesh(); });
     form->addRow("图层操作", fillLayer);
 
-    auto* clearLayer = new QPushButton("清除全部顶点色", this);
-    connect(clearLayer, &QPushButton::clicked, this, &MainWindow::clearVertexColors);
-    form->addRow(clearLayer);
+    auto* clearRow = new QWidget(this);
+    auto* clearLayout = new QHBoxLayout(clearRow);
+    clearLayout->setContentsMargins(0,0,0,0);
+    auto* clearLayer = new QPushButton("清除当前图层", this);
+    auto* clearChannel = new QPushButton("清除当前通道", this);
+    auto* clearSelected = new QPushButton("清除选中对象", this);
+    auto* clearAll = new QPushButton("清除全部对象", this);
+    connect(clearLayer, &QPushButton::clicked, this, [this](){ if (m_viewport) { m_viewport->clearCurrentLayer(); refreshSceneInfo(); log("已清除当前顶点色图层。"); } });
+    connect(clearChannel, &QPushButton::clicked, this, [this](){ if (m_viewport) { m_viewport->clearCurrentChannel(); refreshSceneInfo(); log("已清除当前显示通道。"); } });
+    connect(clearSelected, &QPushButton::clicked, this, [this](){ if (m_viewport) { m_viewport->clearSelectedMeshVertexColors(); refreshSceneInfo(); log("已清除当前选中对象顶点色。"); } });
+    connect(clearAll, &QPushButton::clicked, this, &MainWindow::clearVertexColors);
+    clearLayout->addWidget(clearLayer);
+    clearLayout->addWidget(clearChannel);
+    clearLayout->addWidget(clearSelected);
+    clearLayout->addWidget(clearAll);
+    form->addRow("清除", clearRow);
 
-    auto* layerOpacity = new SliderRow(0, 1, 1, 2, this);
-    connect(layerOpacity, &SliderRow::valueChanged, this, [this](float v){ if (m_viewport) m_viewport->setLayerOpacity(v); markDirty(); });
+    auto* layerOpacity = new QSpinBox(this);
+    layerOpacity->setRange(0, 100);
+    layerOpacity->setValue(100);
+    layerOpacity->setSuffix(" %");
+    connect(layerOpacity, &QSpinBox::valueChanged, this, [this](int v){ if (m_viewport) m_viewport->setLayerOpacity(float(v) / 100.0f); markDirty(); });
     form->addRow("图层不透明度", layerOpacity);
 
     auto* lockRow = new QWidget(this);
     auto* lockLayout = new QHBoxLayout(lockRow);
     lockLayout->setContentsMargins(0,0,0,0);
-    m_lockRedCheck = new QCheckBox("锁R", this);
-    m_lockGreenCheck = new QCheckBox("锁G", this);
-    m_lockBlueCheck = new QCheckBox("锁B", this);
+    m_lockRedCheck = new QPushButton("锁R", this);
+    m_lockGreenCheck = new QPushButton("锁G", this);
+    m_lockBlueCheck = new QPushButton("锁B", this);
+    m_lockRedCheck->setCheckable(true);
+    m_lockGreenCheck->setCheckable(true);
+    m_lockBlueCheck->setCheckable(true);
+    m_lockRedCheck->setProperty("toolButton", true);
+    m_lockGreenCheck->setProperty("toolButton", true);
+    m_lockBlueCheck->setProperty("toolButton", true);
     auto updateLocks = [this](){
         if (m_viewport) m_viewport->setLockedChannels(m_lockRedCheck->isChecked(), m_lockGreenCheck->isChecked(), m_lockBlueCheck->isChecked());
         markDirty();
     };
-    connect(m_lockRedCheck, &QCheckBox::toggled, this, updateLocks);
-    connect(m_lockGreenCheck, &QCheckBox::toggled, this, updateLocks);
-    connect(m_lockBlueCheck, &QCheckBox::toggled, this, updateLocks);
+    connect(m_lockRedCheck, &QPushButton::toggled, this, updateLocks);
+    connect(m_lockGreenCheck, &QPushButton::toggled, this, updateLocks);
+    connect(m_lockBlueCheck, &QPushButton::toggled, this, updateLocks);
     lockLayout->addWidget(m_lockRedCheck);
     lockLayout->addWidget(m_lockGreenCheck);
     lockLayout->addWidget(m_lockBlueCheck);
@@ -846,23 +1127,266 @@ QWidget* MainWindow::buildVertexPaintPanel() {
     auto* rgbRow = new QWidget(this);
     auto* rgbLayout = new QHBoxLayout(rgbRow);
     rgbLayout->setContentsMargins(0,0,0,0);
-    auto* red = new QCheckBox("R", this);
-    auto* green = new QCheckBox("G", this);
-    auto* blue = new QCheckBox("B", this);
+    auto* red = new QPushButton("R", this);
+    auto* green = new QPushButton("G", this);
+    auto* blue = new QPushButton("B", this);
+    red->setCheckable(true);
+    green->setCheckable(true);
+    blue->setCheckable(true);
+    red->setProperty("toolButton", true);
+    green->setProperty("toolButton", true);
+    blue->setProperty("toolButton", true);
     red->setChecked(true); green->setChecked(true); blue->setChecked(true);
     auto updateChannels = [this, red, green, blue](){
         if (m_viewport) m_viewport->setVisibleChannels(red->isChecked(), green->isChecked(), blue->isChecked());
         markDirty();
     };
-    connect(red, &QCheckBox::toggled, this, updateChannels);
-    connect(green, &QCheckBox::toggled, this, updateChannels);
-    connect(blue, &QCheckBox::toggled, this, updateChannels);
+    connect(red, &QPushButton::toggled, this, updateChannels);
+    connect(green, &QPushButton::toggled, this, updateChannels);
+    connect(blue, &QPushButton::toggled, this, updateChannels);
     rgbLayout->addWidget(red);
     rgbLayout->addWidget(green);
     rgbLayout->addWidget(blue);
     form->addRow("RGB显示/隐藏", rgbRow);
 
     return box;
+}
+
+QWidget* MainWindow::buildPreviewPanel() {
+    auto* box = new QGroupBox("右下预览", this);
+    auto* layout = new QVBoxLayout(box);
+
+    auto* modeRow = new QWidget(this);
+    auto* modeLayout = new QHBoxLayout(modeRow);
+    modeLayout->setContentsMargins(0, 0, 0, 0);
+    modeLayout->addWidget(new QLabel("显示模式", this));
+    m_previewMode = new QComboBox(this);
+    m_previewMode->addItems({"AO 预览", "顶点色预览", "贴图预览", "原始模型", "白模", "线框", "单通道 R", "单通道 G", "单通道 B", "Alpha"});
+    modeLayout->addWidget(m_previewMode, 1);
+    layout->addWidget(modeRow);
+
+    m_previewImageBox = new QWidget(this);
+    auto* imageLayout = new QVBoxLayout(m_previewImageBox);
+    imageLayout->setContentsMargins(0, 0, 0, 0);
+    m_previewImage = new QPushButton(this);
+    m_previewImage->setMinimumSize(220, 132);
+    m_previewImage->setIconSize(QSize(220, 132));
+    m_previewImage->setProperty("toolButton", true);
+    m_previewImage->setText("暂无预览\n导入模型后显示 AO 缩略图");
+    m_previewImage->setToolTip("点击放大预览图");
+    imageLayout->addWidget(m_previewImage);
+    layout->addWidget(m_previewImageBox);
+
+    m_previewInfo = new QLabel("预览：等待模型 / 参数变化后自动更新", this);
+    m_previewInfo->setWordWrap(true);
+    m_previewInfo->setStyleSheet("color:#9fb5d1; background:#151a20; border:1px solid #39424c; padding:4px; border-radius:4px;");
+    layout->addWidget(m_previewInfo);
+
+    auto* buttonRow = new QWidget(this);
+    auto* buttonLayout = new QHBoxLayout(buttonRow);
+    buttonLayout->setContentsMargins(0, 0, 0, 0);
+    auto* refresh = new QPushButton("刷新", this);
+    auto* save = new QPushButton("保存", this);
+    auto* copy = new QPushButton("复制", this);
+    m_previewCompareButton = new QPushButton("前后对比", this);
+    m_previewCompareButton->setCheckable(true);
+    m_previewCompareButton->setProperty("toolButton", true);
+    buttonLayout->addWidget(refresh);
+    buttonLayout->addWidget(save);
+    buttonLayout->addWidget(copy);
+    buttonLayout->addWidget(m_previewCompareButton);
+    layout->addWidget(buttonRow);
+
+    m_previewUpdateTimer = new QTimer(this);
+    m_previewUpdateTimer->setSingleShot(true);
+    m_previewUpdateTimer->setInterval(180);
+    connect(m_previewUpdateTimer, &QTimer::timeout, this, &MainWindow::updatePreviewThumbnail);
+    connect(m_previewMode, &QComboBox::currentTextChanged, this, [this](const QString& mode){
+        if (m_viewport) {
+            if (mode == "顶点色预览") m_viewport->setDisplayMode("顶点色模式");
+            else if (mode == "贴图预览") m_viewport->setDisplayMode("AO 贴图预览");
+            else if (mode == "原始模型") m_viewport->setDisplayMode("材质模式");
+            else if (mode == "白模") m_viewport->setDisplayMode("实体模式");
+            else if (mode == "线框") m_viewport->setDisplayMode("线框模式");
+            else m_viewport->setDisplayMode("AO 预览");
+        }
+        updatePreviewThumbnail();
+    });
+    connect(refresh, &QPushButton::clicked, this, &MainWindow::updatePreviewThumbnail);
+    connect(save, &QPushButton::clicked, this, &MainWindow::savePreviewImage);
+    connect(copy, &QPushButton::clicked, this, &MainWindow::copyPreviewImage);
+    connect(m_previewImage, &QPushButton::clicked, this, &MainWindow::openPreviewLarge);
+    connect(m_previewCompareButton, &QPushButton::toggled, this, [this](bool v){
+        m_previewCompareEnabled = v;
+        updatePreviewThumbnail();
+    });
+
+    QTimer::singleShot(0, this, &MainWindow::updatePreviewThumbnail);
+    return box;
+}
+
+QPixmap MainWindow::renderPreviewPixmap(const QString& mode, const QSize& size, bool before) const {
+    QPixmap pix(size);
+    pix.fill(Qt::transparent);
+    QPainter p(&pix);
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    QLinearGradient bg(0, 0, 0, size.height());
+    bg.setColorAt(0.0, QColor(23, 28, 35));
+    bg.setColorAt(1.0, QColor(15, 18, 24));
+    p.fillRect(QRect(QPoint(0, 0), size), bg);
+
+    p.setPen(QPen(QColor(57, 66, 76), 1));
+    p.drawRoundedRect(QRectF(0.5, 0.5, size.width() - 1, size.height() - 1), 6, 6);
+
+    if (m_scene.empty()) {
+        p.setPen(QColor(160, 172, 188));
+        p.drawText(QRect(QPoint(0, 0), size), Qt::AlignCenter, "暂无模型预览");
+        return pix;
+    }
+
+    QVector3D minV(1e9f, 1e9f, 1e9f), maxV(-1e9f, -1e9f, -1e9f);
+    for (const auto& mesh : m_scene.meshes) {
+        if (!mesh.visible) continue;
+        for (const auto& v : mesh.vertices) {
+            minV.setX(std::min(minV.x(), v.position.x()));
+            minV.setY(std::min(minV.y(), v.position.y()));
+            minV.setZ(std::min(minV.z(), v.position.z()));
+            maxV.setX(std::max(maxV.x(), v.position.x()));
+            maxV.setY(std::max(maxV.y(), v.position.y()));
+            maxV.setZ(std::max(maxV.z(), v.position.z()));
+        }
+    }
+    const QVector3D center = (minV + maxV) * 0.5f;
+    const QVector3D extent = maxV - minV;
+    const float scale = std::max(0.0001f, std::max({extent.x(), extent.y(), extent.z()}));
+    auto project = [&](const QVector3D& v){
+        const QVector3D d = (v - center) / scale;
+        const float yaw = -0.62f;
+        const float pitch = 0.34f;
+        const float x = d.x() * std::cos(yaw) - d.z() * std::sin(yaw);
+        const float z = d.x() * std::sin(yaw) + d.z() * std::cos(yaw);
+        const float y = d.y() * std::cos(pitch) - z * std::sin(pitch);
+        const float f = std::min(size.width(), size.height()) * 0.88f;
+        return QPointF(size.width() * 0.5 + x * f, size.height() * 0.52 - y * f);
+    };
+
+    QRectF bounds;
+    QVector<QPair<QPolygonF, QColor>> polys;
+    for (const auto& mesh : m_scene.meshes) {
+        if (!mesh.visible) continue;
+        for (const auto& f : mesh.faces) {
+            if (f.i0 < 0 || f.i1 < 0 || f.i2 < 0 || f.i0 >= mesh.vertices.size() || f.i1 >= mesh.vertices.size() || f.i2 >= mesh.vertices.size()) continue;
+            const Vertex& v0 = mesh.vertices[f.i0];
+            const Vertex& v1 = mesh.vertices[f.i1];
+            const Vertex& v2 = mesh.vertices[f.i2];
+            QPolygonF poly({project(v0.position), project(v1.position), project(v2.position)});
+            bounds |= poly.boundingRect();
+            QColor c = QColor(205, 211, 219);
+            if (mode == "顶点色预览" && mesh.hasVertexColor) c = v0.color;
+            else if (mode == "原始模型") c = QColor(188, 198, 210);
+            else if (mode == "白模") c = QColor(230, 232, 235);
+            else if (mode == "单通道 R") c = QColor(v0.color.red(), v0.color.red(), v0.color.red());
+            else if (mode == "单通道 G") c = QColor(v0.color.green(), v0.color.green(), v0.color.green());
+            else if (mode == "单通道 B") c = QColor(v0.color.blue(), v0.color.blue(), v0.color.blue());
+            else if (mode == "Alpha") c = QColor(v0.color.alpha(), v0.color.alpha(), v0.color.alpha());
+            else if (mode == "贴图预览") c = QColor(185, 190, 198);
+            const QVector3D n = v0.normal.lengthSquared() > 0.00001f ? v0.normal.normalized() : QVector3D(0, 1, 0);
+            float ao = 1.0f - std::clamp((1.0f - (n.y() + 1.0f) * 0.5f) * m_settings.aoStrength, 0.0f, 0.72f);
+            if (before) ao = 1.0f;
+            if (mode == "AO 预览" || mode == "贴图预览" || mode == "白模") {
+                c = QColor(std::clamp(int(c.red() * ao), 0, 255), std::clamp(int(c.green() * ao), 0, 255), std::clamp(int(c.blue() * ao), 0, 255));
+            }
+            if (before) c = QColor(170, 176, 184);
+            polys.push_back({poly, c});
+        }
+    }
+
+    if (bounds.isValid()) {
+        const QPointF shadowCenter(bounds.center().x(), std::min<double>(size.height() - 24, bounds.bottom() + 8));
+        QRadialGradient shadow(shadowCenter, std::max(30.0, bounds.width() * 0.42));
+        shadow.setColorAt(0, QColor(0, 0, 0, 95));
+        shadow.setColorAt(1, QColor(0, 0, 0, 0));
+        p.setPen(Qt::NoPen);
+        p.setBrush(shadow);
+        p.drawEllipse(shadowCenter, bounds.width() * 0.42, std::max(8.0, bounds.height() * 0.08));
+    }
+
+    for (const auto& item : polys) {
+        if (mode == "线框") {
+            p.setBrush(Qt::NoBrush);
+            p.setPen(QPen(QColor(120, 176, 255), 1));
+        } else {
+            p.setBrush(item.second);
+            p.setPen(QPen(QColor(35, 42, 50, 120), 0.6));
+        }
+        p.drawPolygon(item.first);
+    }
+
+    p.setPen(QColor(215, 225, 238));
+    p.drawText(10, 20, QString("显示模式：%1").arg(mode));
+    p.setPen(QColor(150, 164, 182));
+    p.drawText(10, size.height() - 10, QString("Mesh %1 / V %2 / F %3").arg(m_scene.meshes.size()).arg(m_scene.vertexCount()).arg(m_scene.faceCount()));
+    return pix;
+}
+
+void MainWindow::updatePreviewThumbnail() {
+    if (!m_previewImage || !m_previewMode) return;
+    const QString mode = m_previewMode->currentText();
+    const QSize size(260, 156);
+    if (m_beforePreviewPixmap.isNull()) m_beforePreviewPixmap = renderPreviewPixmap(mode, size, true);
+    m_currentPreviewPixmap = renderPreviewPixmap(mode, size, false);
+    QPixmap shown = m_currentPreviewPixmap;
+    if (m_previewCompareEnabled && !m_beforePreviewPixmap.isNull()) {
+        shown = QPixmap(size);
+        shown.fill(Qt::transparent);
+        QPainter p(&shown);
+        p.drawPixmap(0, 0, m_beforePreviewPixmap);
+        p.drawPixmap(size.width() / 2, 0, m_currentPreviewPixmap.copy(size.width() / 2, 0, size.width() / 2, size.height()));
+        p.setPen(QPen(QColor(255, 220, 88), 2));
+        p.drawLine(size.width() / 2, 0, size.width() / 2, size.height());
+        p.setPen(QColor(255, 255, 255));
+        p.drawText(8, 18, "Before");
+        p.drawText(size.width() / 2 + 8, 18, "After");
+    }
+    m_previewImage->setIcon(QIcon(shown));
+    m_previewImage->setIconSize(size);
+    m_previewImage->setText(QString());
+    if (m_previewInfo) m_previewInfo->setText(QString("预览：%1；参数变化后约 180ms 延迟更新，可点击放大 / 保存 / 复制。").arg(mode));
+}
+
+void MainWindow::openPreviewLarge() {
+    updatePreviewThumbnail();
+    if (m_currentPreviewPixmap.isNull()) return;
+    QDialog dialog(this);
+    dialog.setWindowTitle("预览图放大");
+    auto* layout = new QVBoxLayout(&dialog);
+    auto* label = new QLabel(&dialog);
+    label->setPixmap(m_currentPreviewPixmap.scaled(760, 460, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    label->setAlignment(Qt::AlignCenter);
+    layout->addWidget(label);
+    dialog.resize(820, 520);
+    dialog.exec();
+}
+
+void MainWindow::savePreviewImage() {
+    updatePreviewThumbnail();
+    if (m_currentPreviewPixmap.isNull()) return;
+    const QString path = QFileDialog::getSaveFileName(this, "保存预览图", outputBaseName("_preview.png"), "PNG (*.png);;JPG (*.jpg);;BMP (*.bmp)");
+    if (path.isEmpty()) return;
+    if (m_currentPreviewPixmap.save(path)) {
+        log("预览图已保存：" + path);
+        addRecentFile(path);
+    } else {
+        QMessageBox::warning(this, "保存失败", "预览图保存失败，请检查路径权限。");
+    }
+}
+
+void MainWindow::copyPreviewImage() {
+    updatePreviewThumbnail();
+    if (m_currentPreviewPixmap.isNull()) return;
+    QGuiApplication::clipboard()->setPixmap(m_currentPreviewPixmap);
+    log("预览图已复制到剪贴板。");
 }
 
 QWidget* MainWindow::buildOutputPanel() {
@@ -909,9 +1433,11 @@ QWidget* MainWindow::buildOutputPanel() {
     form->addRow("格式提示", m_formatHint);
     form->addRow("拆分导出", m_splitMode);
     form->addRow("导出命名", m_outputNameEdit);
-    m_autoOpenOutputDir = new QCheckBox("烘焙完成后自动打开输出目录", this);
+    m_autoOpenOutputDir = new QPushButton("烘焙完成后自动打开输出目录", this);
+    m_autoOpenOutputDir->setCheckable(true);
     m_autoOpenOutputDir->setChecked(m_settings.autoOpenOutputDir);
-    connect(m_autoOpenOutputDir, &QCheckBox::toggled, this, [this](bool v){
+    m_autoOpenOutputDir->setProperty("toolButton", true);
+    connect(m_autoOpenOutputDir, &QPushButton::toggled, this, [this](bool v){
         m_settings.autoOpenOutputDir = v;
         markDirty();
     });
@@ -954,8 +1480,16 @@ void MainWindow::applyStyle() {
         QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
         QLineEdit, QTextEdit, QTreeWidget, QComboBox, QSpinBox { background: #151a20; border: 1px solid #39424c; color: #d7dde5; padding: 4px; }
         QCheckBox, QRadioButton, QLabel { color: #d7dde5; }
-        QPushButton { background: #206dd6; border: 0; padding: 8px 12px; border-radius: 4px; color: white; }
+        QPushButton { background: #206dd6; border: 1px solid transparent; padding: 8px 12px; border-radius: 4px; color: white; }
         QPushButton:hover { background: #2b7de9; }
+        QPushButton:checked { background: #2d8cff; border: 1px solid #b9dcff; color: white; font-weight: 600; }
+        QPushButton[toolButton="true"] { background: #151a20; border: 1px solid #39424c; color: #d7dde5; }
+        QPushButton[toolButton="true"]:hover { background: #26313c; border: 1px solid #55708c; }
+        QPushButton[toolButton="true"]:checked { background: #2d8cff; border: 1px solid #d6ebff; color: #ffffff; font-weight: 700; }
+        QPushButton[colorChip="true"] { border: 1px solid #39424c; padding: 0; border-radius: 4px; }
+        QPushButton[colorChip="true"]:checked { border: 3px solid #ffffff; }
+        QCheckBox::indicator, QRadioButton::indicator { width: 15px; height: 15px; border: 1px solid #657180; background: #151a20; }
+        QCheckBox::indicator:checked, QRadioButton::indicator:checked { background: #2d8cff; border: 1px solid #c7e1ff; }
         QSlider::groove:horizontal { height: 4px; background: #34404b; }
         QSlider::handle:horizontal { width: 12px; background: #2d8cff; margin: -5px 0; border-radius: 6px; }
         QStatusBar { background: #171c22; border-top: 1px solid #39424c; }
@@ -1082,21 +1616,102 @@ void MainWindow::importRecentModel() {
 }
 
 void MainWindow::refreshSceneInfo() {
+    QSignalBlocker treeBlocker(m_tree);
     m_tree->clear();
-    auto* root = new QTreeWidgetItem(QStringList() << QFileInfo(m_scene.sourcePath).fileName());
+    m_tree->setColumnWidth(0, 170);
+    m_tree->setColumnWidth(1, 150);
+    m_tree->setColumnWidth(2, 70);
+    m_tree->setColumnWidth(3, 60);
+    m_tree->setColumnWidth(4, 56);
+
+    const QString fileName = QFileInfo(m_scene.sourcePath).fileName().isEmpty() ? QStringLiteral("untitled.fbx") : QFileInfo(m_scene.sourcePath).fileName();
+    auto* fileRoot = new QTreeWidgetItem(QStringList() << fileName << "文件" << QString::number(m_scene.vertexCount()) << "-" << "");
+    fileRoot->setData(0, Qt::UserRole, -1);
+    auto* root = new QTreeWidgetItem(QStringList() << "RootNode" << "根节点" << QString::number(m_scene.vertexCount()) << QString::number(m_scene.meshes.size()) << "");
     root->setData(0, Qt::UserRole, -1);
+    fileRoot->addChild(root);
     for (int i = 0; i < m_scene.meshes.size(); ++i) {
-        auto* item = new QTreeWidgetItem(QStringList() << m_scene.meshes[i].name);
+        const auto& mesh = m_scene.meshes[i];
+        QStringList warnings;
+        if (!mesh.hasUV) warnings << "无UV";
+        if (!mesh.hasNormals) warnings << "无法线";
+        if (mesh.faces.isEmpty()) warnings << "无材质";
+        if (!mesh.hasVertexColor) warnings << "无顶点色";
+        const QString status = warnings.isEmpty() ? QStringLiteral("正常") : QStringLiteral("警告：") + warnings.join(" / ");
+        auto* item = new QTreeWidgetItem(QStringList() << mesh.name << status << QString::number(mesh.vertices.size()) << QString::number(mesh.faces.isEmpty() ? 0 : 1) << (mesh.visible ? "显示" : "隐藏"));
         item->setData(0, Qt::UserRole, i);
+        item->setFlags(item->flags() | Qt::ItemIsEditable | Qt::ItemIsUserCheckable | Qt::ItemIsSelectable);
+        item->setCheckState(4, mesh.visible ? Qt::Checked : Qt::Unchecked);
+        if (!warnings.isEmpty()) item->setForeground(1, QBrush(QColor(244, 195, 106)));
         root->addChild(item);
     }
+    fileRoot->setExpanded(true);
     root->setExpanded(true);
-    m_tree->addTopLevelItem(root);
-    m_modelInfo->setText(QString("文件：%1\n顶点数：%2\n三角面：%3\nMesh：%4")
-        .arg(m_scene.sourcePath).arg(m_scene.vertexCount()).arg(m_scene.faceCount()).arg(m_scene.meshes.size()));
+    m_tree->addTopLevelItem(fileRoot);
+    bool smoothingDetected = false;
+    for (const auto& mesh : m_scene.meshes) {
+        for (const auto& face : mesh.faces) {
+            if (face.smoothingMask != 0) {
+                smoothingDetected = true;
+                break;
+            }
+        }
+        if (smoothingDetected) break;
+    }
+    m_modelInfo->setText(QString("文件：%1\n顶点数：%2\n三角面：%3\nMesh：%4\n光滑组：%5")
+        .arg(m_scene.sourcePath)
+        .arg(m_scene.vertexCount())
+        .arg(m_scene.faceCount())
+        .arg(m_scene.meshes.size())
+        .arg(smoothingDetected ? "已检测，保留" : "未检测"));
     m_uvInfo->setText(QString("UV Mesh：%1/%2\n导入保留 UV、法线、顶点色；FBX 由 Assimp + 内置 fallback 独立解析。")
         .arg(m_scene.uvMeshCount()).arg(m_scene.meshes.size()));
     updateStatusSummary();
+    if (m_previewUpdateTimer) m_previewUpdateTimer->start();
+}
+
+void MainWindow::showMeshContextMenu(const QPoint& pos) {
+    if (!m_tree) return;
+    QTreeWidgetItem* item = m_tree->itemAt(pos);
+    if (!item) return;
+    const int meshIndex = item->data(0, Qt::UserRole).toInt();
+    if (meshIndex < 0 || meshIndex >= m_scene.meshes.size()) return;
+
+    QMenu menu(this);
+    menu.addAction(m_scene.meshes[meshIndex].visible ? "隐藏" : "显示", this, [this, meshIndex](){
+        const bool visible = !m_scene.meshes[meshIndex].visible;
+        if (m_viewport) m_viewport->setMeshVisible(meshIndex, visible);
+        m_scene.meshes[meshIndex].visible = visible;
+        refreshSceneInfo();
+        markDirty();
+    });
+    menu.addAction("只显示该对象", this, [this, meshIndex](){ if (m_viewport) m_viewport->showOnlyMesh(meshIndex); refreshSceneInfo(); markDirty(); });
+    menu.addAction("聚焦对象", this, [this, meshIndex](){ if (m_viewport) { m_viewport->setSelectedMesh(meshIndex); m_viewport->focusModel(); } onMeshSelected(meshIndex, m_scene.meshes[meshIndex].name); });
+    menu.addSeparator();
+    menu.addAction("重命名", this, [this, meshIndex](){
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, "重命名 Mesh", "新名称", QLineEdit::Normal, m_scene.meshes[meshIndex].name, &ok);
+        if (ok && !name.trimmed().isEmpty()) { m_scene.meshes[meshIndex].name = name.trimmed(); refreshSceneInfo(); markDirty(); }
+    });
+    menu.addAction("删除", this, [this, meshIndex](){ if (m_viewport) m_viewport->deleteMesh(meshIndex); refreshSceneInfo(); markDirty(); });
+    menu.addAction("复制", this, [this, meshIndex](){ if (m_viewport) m_viewport->duplicateMesh(meshIndex); refreshSceneInfo(); markDirty(); });
+    menu.addAction("查看属性", this, [this, meshIndex](){
+        const auto& mesh = m_scene.meshes[meshIndex];
+        QMessageBox::information(this, "Mesh 属性", QString("名称：%1\n顶点数：%2\n三角面：%3\nUV：%4\n法线：%5\n顶点色：%6\n显示：%7")
+            .arg(mesh.name).arg(mesh.vertices.size()).arg(mesh.faces.size())
+            .arg(mesh.hasUV ? "有" : "无").arg(mesh.hasNormals ? "有" : "无")
+            .arg(mesh.hasVertexColor ? "有" : "无").arg(mesh.visible ? "显示" : "隐藏"));
+    });
+    menu.addSeparator();
+    menu.addAction("清除顶点色", this, [this, meshIndex](){ if (m_viewport) { m_viewport->setSelectedMesh(meshIndex); m_viewport->clearSelectedMeshVertexColors(); } refreshSceneInfo(); markDirty(); });
+    menu.addAction("填充顶点色", this, [this, meshIndex](){ if (m_viewport) { m_viewport->setSelectedMesh(meshIndex); m_viewport->fillSelectedMesh(); } refreshSceneInfo(); markDirty(); });
+    menu.addAction("烘焙该对象", this, [this, meshIndex](){ if (m_viewport) m_viewport->setSelectedMesh(meshIndex); if (m_bakeScope) m_bakeScope->setCurrentText("选中对象"); bakeVertex(); });
+    menu.addAction("导出该对象", this, [this, meshIndex](){ if (m_viewport) m_viewport->setSelectedMesh(meshIndex); exportCurrentModel(); });
+    menu.addAction("重新计算法线", this, [this, meshIndex](){ if (m_viewport) m_viewport->setSelectedMesh(meshIndex); recalculateNormals(false); refreshSceneInfo(); markDirty(); });
+    menu.addSeparator();
+    menu.addAction("查看 UV", this, [this, meshIndex](){ QMessageBox::information(this, "UV", m_scene.meshes[meshIndex].hasUV ? "该对象包含 UV。" : "该对象无 UV。建议检查或重新展开 UV。"); });
+    menu.addAction("查看材质", this, [this, meshIndex](){ QMessageBox::information(this, "材质", QString("当前对象材质槽数量：%1").arg(m_scene.meshes[meshIndex].faces.isEmpty() ? 0 : 1)); });
+    menu.exec(m_tree->viewport()->mapToGlobal(pos));
 }
 
 void MainWindow::chooseOutputDir() {
@@ -1162,19 +1777,24 @@ void MainWindow::runBake(bool texture) {
     }
 
     BakeSettings activeSettings = m_settings;
-    activeSettings.vertexColorChannels = QStringLiteral("RGB");
+    if (activeSettings.vertexColorChannels.trimmed().isEmpty()) {
+        activeSettings.vertexColorChannels = QStringLiteral("RGB");
+    }
     activeSettings.selectedMeshIndex = m_viewport ? m_viewport->selectedMesh() : -1;
     if (activeSettings.bakeScope == QStringLiteral("选中对象") && activeSettings.selectedMeshIndex < 0) {
         QMessageBox::warning(this, "未选择对象", "当前烘焙范围为“选中对象”，请先在视口或模型树中选择一个 Mesh。");
         return;
     }
-    if (activeSettings.bakeScope == QStringLiteral("可见对象")) {
-        log("当前版本尚未提供 Mesh 显隐状态记录，本次“可见对象”按全场景执行。 ");
-    }
 
     SceneData textureScene = m_scene;
     if (activeSettings.bakeScope == QStringLiteral("选中对象")) {
         textureScene = buildSceneForSelectedMesh(m_scene, activeSettings.selectedMeshIndex);
+    } else if (activeSettings.bakeScope == QStringLiteral("可见对象")) {
+        textureScene = buildSceneForVisibleMeshes(m_scene);
+        if (textureScene.meshes.isEmpty()) {
+            QMessageBox::warning(this, "没有可见对象", "当前烘焙范围为“可见对象”，但没有检测到可见 Mesh。请先在模型树中显示至少一个对象。");
+            return;
+        }
     }
     if (texture && !sceneHasUvFaces(textureScene)) {
         QMessageBox::warning(this, "UV 检查未通过", "AO 烘焙到贴图需要模型包含有效 UV。请先导入带 UV 的模型，或运行 UV 检查器查看详情。");
@@ -1209,6 +1829,7 @@ void MainWindow::runBake(bool texture) {
 
     try {
         AOBaker baker;
+        connect(&progress, &QProgressDialog::canceled, &baker, &AOBaker::requestCancel);
         connect(&baker, &AOBaker::progress, this, [&](const QString& msg, int percent){
             progress.setValue(std::clamp(percent, 0, 99));
             progress.setLabelText(msg);
@@ -1217,17 +1838,24 @@ void MainWindow::runBake(bool texture) {
             if (progress.wasCanceled()) throw std::runtime_error("用户取消烘焙");
         });
 
-        log(QString("开始 AO 烘焙：模式=%1，范围=%2，顶点色写入=%3，通道=RGB，采样=%4，距离=%5")
+        log(QString("开始 AO 烘焙：模式=%1，范围=%2，顶点色写入=%3，通道=%4，采样=%5，距离=%6，加速=%7，多线程=%8，分块=%9，缓存=%10")
             .arg(texture ? QStringLiteral("贴图") : QStringLiteral("顶点色"))
             .arg(activeSettings.bakeScope)
             .arg(activeSettings.vertexColorWriteMode)
+            .arg(activeSettings.vertexColorChannels)
             .arg(activeSettings.sampleCount)
-            .arg(activeSettings.rayDistance));
+            .arg(activeSettings.rayDistance)
+            .arg(activeSettings.accelerationMode)
+            .arg(activeSettings.multiThreadedBake ? QStringLiteral("开") : QStringLiteral("关"))
+            .arg(activeSettings.bakeBlockSize)
+            .arg(activeSettings.cacheAccelerationStructure ? QStringLiteral("开") : QStringLiteral("关")));
 
         baker.bakeToVertexColor(m_scene, activeSettings);
         if (m_viewport) m_viewport->pushVertexColorUndo(beforeColors);
         if (activeSettings.bakeScope == QStringLiteral("选中对象")) {
             textureScene = buildSceneForSelectedMesh(m_scene, activeSettings.selectedMeshIndex);
+        } else if (activeSettings.bakeScope == QStringLiteral("可见对象")) {
+            textureScene = buildSceneForVisibleMeshes(m_scene);
         } else {
             textureScene = m_scene;
         }
@@ -1317,6 +1945,9 @@ void MainWindow::runBake(bool texture) {
             m_viewport->setBakeSettings(m_settings);
             m_viewport->update();
         }
+        refreshSceneInfo();
+        if (m_previewUpdateTimer) m_previewUpdateTimer->start();
+        else updatePreviewThumbnail();
         markDirty();
         log(message);
         if (m_settings.autoOpenOutputDir) {
@@ -1388,10 +2019,18 @@ void MainWindow::exportCurrentModel() {
 
     auto* optionsBox = new QGroupBox("可选导出内容", &dialog);
     auto* optionsLayout = new QVBoxLayout(optionsBox);
-    auto* normalsCheck = new QCheckBox("导出法线 / 软硬边结果", &dialog);
-    auto* uvCheck = new QCheckBox("导出 UV", &dialog);
-    auto* vertexColorCheck = new QCheckBox("导出顶点色 / AO 结果", &dialog);
-    auto* selectedOnlyCheck = new QCheckBox("仅导出当前选中 Mesh", &dialog);
+    auto* normalsCheck = new QPushButton("导出法线 / 软硬边结果", &dialog);
+    auto* uvCheck = new QPushButton("导出 UV", &dialog);
+    auto* vertexColorCheck = new QPushButton("导出顶点色 / AO 结果", &dialog);
+    auto* selectedOnlyCheck = new QPushButton("仅导出当前选中 Mesh", &dialog);
+    normalsCheck->setCheckable(true);
+    uvCheck->setCheckable(true);
+    vertexColorCheck->setCheckable(true);
+    selectedOnlyCheck->setCheckable(true);
+    normalsCheck->setProperty("toolButton", true);
+    uvCheck->setProperty("toolButton", true);
+    vertexColorCheck->setProperty("toolButton", true);
+    selectedOnlyCheck->setProperty("toolButton", true);
     normalsCheck->setChecked(true);
     uvCheck->setChecked(true);
     vertexColorCheck->setChecked(true);
@@ -1706,12 +2345,45 @@ void MainWindow::onSettingsChanged() {
     if (m_viewport) {
         m_viewport->setBakeSettings(m_settings);
     }
+    if (m_previewUpdateTimer) m_previewUpdateTimer->start();
     markDirty();
     statusBar()->showMessage("AO 参数已更新，视口实时预览已刷新", 1500);
 }
 
-void MainWindow::recalculateNormals() {
+void MainWindow::recalculateNormals(bool splitNormals) {
     for (auto& mesh : m_scene.meshes) {
+        if (splitNormals) {
+            QVector<Vertex> splitVertices;
+            QVector<Face> splitFaces;
+            splitVertices.reserve(mesh.faces.size() * 3);
+            splitFaces.reserve(mesh.faces.size());
+            for (const auto& face : mesh.faces) {
+                if (face.i0 < 0 || face.i1 < 0 || face.i2 < 0 ||
+                    face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size()) {
+                    continue;
+                }
+                Vertex v0 = mesh.vertices[face.i0];
+                Vertex v1 = mesh.vertices[face.i1];
+                Vertex v2 = mesh.vertices[face.i2];
+                QVector3D n = QVector3D::crossProduct(v1.position - v0.position, v2.position - v0.position);
+                n = n.lengthSquared() > 1e-8f ? n.normalized() : QVector3D(0, 0, 1);
+                v0.normal = n;
+                v1.normal = n;
+                v2.normal = n;
+                Face nf = face;
+                nf.i0 = splitVertices.size(); splitVertices.push_back(v0);
+                nf.i1 = splitVertices.size(); splitVertices.push_back(v1);
+                nf.i2 = splitVertices.size(); splitVertices.push_back(v2);
+                splitFaces.push_back(nf);
+            }
+            if (!splitVertices.isEmpty()) {
+                mesh.vertices = splitVertices;
+                mesh.faces = splitFaces;
+            }
+            mesh.hasNormals = true;
+            continue;
+        }
+
         for (auto& vertex : mesh.vertices) {
             vertex.normal = QVector3D(0, 0, 0);
         }
@@ -1777,6 +2449,7 @@ void MainWindow::repairFaceOrientation() {
     }
 
     recalculateNormals();
+    refreshSceneInfo();
     if (m_viewport) {
         m_viewport->setScene(&m_scene);
         m_viewport->setBakeSettings(m_settings);
@@ -1800,6 +2473,7 @@ void MainWindow::unifySmoothingGroups() {
         }
     }
     recalculateNormals();
+    refreshSceneInfo();
     if (m_viewport) {
         m_viewport->setScene(&m_scene);
         m_viewport->setBakeSettings(m_settings);
@@ -1877,9 +2551,9 @@ void MainWindow::openPreferences() {
     tabs->addTab(makeTab({"启动行为|恢复上次窗口与布局", "最近文件数量|10", "项目格式|.aobproj"}), "通用设置");
     tabs->addTab(makeTab({"导航方式|Maya Alt+鼠标", "默认线框|开启", "实时预览|开启", "默认材质色|#bcc6d2"}), "视口设置");
     tabs->addTab(makeTab({"默认导入|保留 UV / 法线 / 顶点色", "默认导出|GLB", "导出内容|法线、UV、顶点色"}), "导入导出设置");
-    tabs->addTab(makeTab({"采样数|" + QString::number(m_settings.sampleCount), "射线距离|" + QString::number(m_settings.rayDistance), "自适应采样|开启"}), "烘焙设置");
+    tabs->addTab(makeTab({"采样数|" + QString::number(m_settings.sampleCount), "射线距离|" + QString::number(m_settings.rayDistance), "自适应采样|开启", "加速结构|" + m_settings.accelerationMode, "缓存加速结构|开启"}), "烘焙设置");
     tabs->addTab(makeTab({"画笔大小|24", "不透明度|1.0", "软笔刷|开启", "忽略背面|开启"}), "顶点绘制设置");
-    tabs->addTab(makeTab({"性能模式|平衡", "大模型策略|增量记录顶点色", "批处理失败|继续执行"}), "性能设置");
+    tabs->addTab(makeTab({"性能模式|平衡", "大模型策略|BVH/KD-Tree + 多线程 + 分块", "CPU方案|Embree 类遍历预设", "GPU Compute|扩展入口预留", "批处理失败|继续执行"}), "性能设置");
     tabs->addTab(makeTab({"撤销|Ctrl+Z", "重做|Ctrl+Y / Ctrl+Shift+Z", "聚焦模型|F"}), "快捷键设置");
     tabs->addTab(makeTab({"自动保存|开启", "自动恢复文件|autosave_recovery.aobproj", "保存间隔|退出和关键操作时"}), "自动保存设置");
     tabs->addTab(makeTab({"主题|深色", "Windows 标题栏|暗色适配", "高 DPI|开启"}), "主题设置");
@@ -1906,11 +2580,34 @@ void MainWindow::runModelChecker() {
     int warningCount = 0;
     int emptyMeshes = 0;
     int invalidFaces = 0;
-    int degenerateFaces = 0;
+    int tinyFaces = 0;
+    int isolatedVertices = 0;
+    int duplicateVertices = 0;
+    int nonManifoldEdges = 0;
     int missingNormalMeshes = 0;
     int missingUvMeshes = 0;
     int missingVertexColorMeshes = 0;
+    int materialMissingFaces = 0;
+    int reversedFaces = 0;
     int smoothingFaces = 0;
+    int smoothingMeshes = 0;
+
+    QVector3D sceneMin(1e9f, 1e9f, 1e9f), sceneMax(-1e9f, -1e9f, -1e9f);
+    bool hasSceneVertex = false;
+    for (const auto& mesh : m_scene.meshes) {
+        for (const auto& v : mesh.vertices) {
+            hasSceneVertex = true;
+            sceneMin.setX(std::min(sceneMin.x(), v.position.x()));
+            sceneMin.setY(std::min(sceneMin.y(), v.position.y()));
+            sceneMin.setZ(std::min(sceneMin.z(), v.position.z()));
+            sceneMax.setX(std::max(sceneMax.x(), v.position.x()));
+            sceneMax.setY(std::max(sceneMax.y(), v.position.y()));
+            sceneMax.setZ(std::max(sceneMax.z(), v.position.z()));
+        }
+    }
+    const QVector3D sceneCenter = hasSceneVertex ? (sceneMin + sceneMax) * 0.5f : QVector3D(0, 0, 0);
+    const float sceneScale = hasSceneVertex ? std::max(0.001f, (sceneMax - sceneMin).length()) : 1.0f;
+    const float tinyAreaThreshold = std::max(1e-10f, sceneScale * sceneScale * 1e-10f);
 
     report << "AO Baker Pro V2 模型检查报告";
     report << "生成时间：" + QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss");
@@ -1921,12 +2618,18 @@ void MainWindow::runModelChecker() {
         .arg(m_scene.vertexCount())
         .arg(m_scene.faceCount())
         .arg(m_scene.uvMeshCount());
+    report << QString("全局阈值：极小面面积 < %1").arg(tinyAreaThreshold, 0, 'g', 6);
     report << "";
 
     for (int meshIndex = 0; meshIndex < m_scene.meshes.size(); ++meshIndex) {
         const MeshData& mesh = m_scene.meshes[meshIndex];
         int meshInvalidFaces = 0;
-        int meshDegenerateFaces = 0;
+        int meshTinyFaces = 0;
+        int meshIsolatedVertices = 0;
+        int meshDuplicateVertices = 0;
+        int meshNonManifoldEdges = 0;
+        int meshMaterialMissingFaces = 0;
+        int meshReversedFaces = 0;
         int meshSmoothingFaces = 0;
 
         if (mesh.vertices.isEmpty() || mesh.faces.isEmpty()) {
@@ -1945,6 +2648,23 @@ void MainWindow::runModelChecker() {
             ++missingVertexColorMeshes;
         }
 
+        QVector<int> vertexUse(mesh.vertices.size(), 0);
+        QHash<QString, int> duplicateMap;
+        QHash<QString, int> edgeUse;
+
+        for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
+            const QString key = vertexKey(mesh.vertices[vertexIndex].position);
+            const int count = duplicateMap.value(key, 0) + 1;
+            duplicateMap.insert(key, count);
+            if (count == 2) {
+                ++meshDuplicateVertices;
+                ++duplicateVertices;
+            } else if (count > 2) {
+                ++meshDuplicateVertices;
+                ++duplicateVertices;
+            }
+        }
+
         for (const Face& face : mesh.faces) {
             const bool invalid = face.i0 < 0 || face.i1 < 0 || face.i2 < 0
                 || face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size();
@@ -1954,57 +2674,114 @@ void MainWindow::runModelChecker() {
                 continue;
             }
 
-            const float area = triangleArea3D(mesh.vertices[face.i0].position, mesh.vertices[face.i1].position, mesh.vertices[face.i2].position);
-            if (area < 1e-8f) {
-                ++degenerateFaces;
-                ++meshDegenerateFaces;
+            vertexUse[face.i0] += 1;
+            vertexUse[face.i1] += 1;
+            vertexUse[face.i2] += 1;
+            edgeUse[edgeKey(face.i0, face.i1)] += 1;
+            edgeUse[edgeKey(face.i1, face.i2)] += 1;
+            edgeUse[edgeKey(face.i2, face.i0)] += 1;
+
+            const QVector3D a = mesh.vertices[face.i0].position;
+            const QVector3D b = mesh.vertices[face.i1].position;
+            const QVector3D c = mesh.vertices[face.i2].position;
+            const QVector3D normal = QVector3D::crossProduct(b - a, c - a);
+            const float area = normal.length() * 0.5f;
+            if (area < tinyAreaThreshold) {
+                ++tinyFaces;
+                ++meshTinyFaces;
+            }
+            if (face.materialIndex < 0) {
+                ++materialMissingFaces;
+                ++meshMaterialMissingFaces;
             }
             if (face.smoothingMask != 0) {
                 ++smoothingFaces;
                 ++meshSmoothingFaces;
             }
+            const QVector3D faceCenter = (a + b + c) / 3.0f;
+            if (normal.lengthSquared() > 1e-8f && QVector3D::dotProduct(normal, faceCenter - sceneCenter) < 0.0f) {
+                ++reversedFaces;
+                ++meshReversedFaces;
+            }
         }
 
+        for (int useCount : vertexUse) {
+            if (useCount == 0) {
+                ++isolatedVertices;
+                ++meshIsolatedVertices;
+            }
+        }
+        for (auto it = edgeUse.constBegin(); it != edgeUse.constEnd(); ++it) {
+            if (it.value() > 2) {
+                ++nonManifoldEdges;
+                ++meshNonManifoldEdges;
+            }
+        }
+        if (meshSmoothingFaces > 0) ++smoothingMeshes;
+
         report << QString("Mesh #%1：%2").arg(meshIndex + 1).arg(mesh.name.isEmpty() ? QStringLiteral("Unnamed") : mesh.name);
-        report << QString("  顶点：%1，三角面：%2，UV：%3，法线：%4，顶点色：%5")
+        report << QString("  顶点：%1，三角面：%2，UV：%3，法线：%4，顶点色：%5，光滑组：%6")
             .arg(mesh.vertices.size())
             .arg(mesh.faces.size())
             .arg(mesh.hasUV ? "有" : "缺失")
             .arg(mesh.hasNormals ? "有" : "缺失")
-            .arg(mesh.hasVertexColor ? "有" : "缺失");
-        report << QString("  无效面：%1，零面积面：%2，含光滑组标记面：%3")
+            .arg(mesh.hasVertexColor ? "有" : "缺失")
+            .arg(meshSmoothingFaces > 0 ? "已检测，保留" : "未检测");
+        report << QString("  无效面：%1，极小面：%2，孤立点：%3，重复顶点：%4，非流形边：%5")
             .arg(meshInvalidFaces)
-            .arg(meshDegenerateFaces)
+            .arg(meshTinyFaces)
+            .arg(meshIsolatedVertices)
+            .arg(meshDuplicateVertices)
+            .arg(meshNonManifoldEdges);
+        report << QString("  材质缺失面：%1，疑似反面：%2，含光滑组标记面：%3")
+            .arg(meshMaterialMissingFaces)
+            .arg(meshReversedFaces)
             .arg(meshSmoothingFaces);
     }
 
-    if (invalidFaces > 0) errorCount += invalidFaces;
-    if (degenerateFaces > 0) warningCount += degenerateFaces;
+    errorCount += invalidFaces;
+    warningCount += tinyFaces + isolatedVertices + duplicateVertices + nonManifoldEdges + materialMissingFaces + reversedFaces;
 
     report << "";
     report << "检查结论：" + severityText(warningCount, errorCount);
     report << QString("错误：%1，警告：%2").arg(errorCount).arg(warningCount);
-    report << QString("空 Mesh：%1，缺失法线 Mesh：%2，缺失 UV Mesh：%3，未携带顶点色 Mesh：%4")
-        .arg(emptyMeshes)
+    report << QString("三角面数量：%1，顶点数量：%2").arg(m_scene.faceCount()).arg(m_scene.vertexCount());
+    report << QString("孤立点：%1，非流形边：%2，法线缺失 Mesh：%3，重复顶点：%4")
+        .arg(isolatedVertices)
+        .arg(nonManifoldEdges)
         .arg(missingNormalMeshes)
+        .arg(duplicateVertices);
+    report << QString("材质缺失面：%1，极小面：%2，疑似反面：%3")
+        .arg(materialMissingFaces)
+        .arg(tinyFaces)
+        .arg(reversedFaces);
+    report << QString("光滑组：%1（带光滑组标记 Mesh：%2，三角面：%3）")
+        .arg(smoothingFaces > 0 ? QStringLiteral("已检测，保留") : QStringLiteral("未检测"))
+        .arg(smoothingMeshes)
+        .arg(smoothingFaces);
+    report << QString("空 Mesh：%1，缺失 UV Mesh：%2，未携带顶点色 Mesh：%3")
+        .arg(emptyMeshes)
         .arg(missingUvMeshes)
         .arg(missingVertexColorMeshes);
-    report << QString("无效三角面：%1，零面积三角面：%2，带光滑组信息三角面：%3")
-        .arg(invalidFaces)
-        .arg(degenerateFaces)
-        .arg(smoothingFaces);
     report << "";
-    report << "建议：";
-    if (invalidFaces > 0) report << "- 存在无效三角面索引，建议重新导出模型或清理拓扑后再烘焙。";
-    if (degenerateFaces > 0) report << "- 存在零面积面，可能导致 AO 或 UV 光栅化结果异常，建议在 DCC 中清理。";
-    if (missingNormalMeshes > 0) report << "- 存在缺失法线的 Mesh，可使用“修复面片朝向”或“统一光滑组”重新计算法线。";
-    if (missingUvMeshes > 0) report << "- 存在缺失 UV 的 Mesh，贴图烘焙会跳过这些 Mesh；顶点色烘焙不受影响。";
-    if (invalidFaces == 0 && degenerateFaces == 0 && missingNormalMeshes == 0 && missingUvMeshes == 0) report << "- 当前模型结构适合继续进行 AO 顶点色与贴图烘焙。";
+    report << "修复建议：";
+    if (invalidFaces > 0) report << "- 存在无效三角面索引：建议重新导出模型，或先在建模软件中执行拓扑清理。";
+    if (tinyFaces > 0) report << "- 存在极小面：建议合并近距离点、删除零面积/极小面积三角面，避免 AO 噪点和 UV 光栅化异常。";
+    if (isolatedVertices > 0) report << "- 存在孤立点：建议删除未被任何面使用的顶点，降低无效数据和导出体积。";
+    if (duplicateVertices > 0) report << "- 存在重复顶点：如果不是硬边或 UV seam 需要，建议执行合并重复点；如需保留硬边，可只合并完全重叠且属性一致的点。";
+    if (nonManifoldEdges > 0) report << "- 存在非流形边：建议检查重叠面、内部面和多壳连接区域，非流形结构可能导致 AO 漏光或黑斑。";
+    if (missingNormalMeshes > 0) report << "- 存在缺失法线：可使用“法线 / 光滑组工具 > 重新计算法线”或“合并法线”。";
+    if (materialMissingFaces > 0) report << "- 存在材质缺失面：建议补充分配默认材质，避免按材质拆分贴图时漏导出。";
+    if (reversedFaces > 0) report << "- 存在疑似反面：可使用“模型多边形面朝向一键修改到正确方向”。";
+    if (smoothingFaces > 0) report << "- 已检测到光滑组信息：当前导入数据会保留 smoothingMask；如需统一软边，可使用“一键全部生成软边”。";
+    if (invalidFaces == 0 && tinyFaces == 0 && isolatedVertices == 0 && nonManifoldEdges == 0 && missingNormalMeshes == 0 && reversedFaces == 0) {
+        report << "- 当前模型结构适合继续进行 AO 顶点色与贴图烘焙。";
+    }
 
     const QString reportText = report.join("\n");
     QDialog dialog(this);
     dialog.setWindowTitle("模型检查器");
-    dialog.resize(780, 560);
+    dialog.resize(860, 620);
     auto* layout = new QVBoxLayout(&dialog);
     auto* text = new QPlainTextEdit(reportText, &dialog);
     text->setReadOnly(true);
@@ -2279,6 +3056,11 @@ void MainWindow::loadAppSettings() {
     m_settings.sampleCount = settings.value("ao/samples", m_settings.sampleCount).toInt();
     m_settings.rayDistance = settings.value("ao/rayDistance", m_settings.rayDistance).toFloat();
     m_settings.detailPreserve = settings.value("ao/detailPreserve", m_settings.detailPreserve).toFloat();
+    m_settings.accelerationMode = settings.value("ao/accelerationMode", m_settings.accelerationMode).toString();
+    m_settings.multiThreadedBake = settings.value("ao/multiThreadedBake", m_settings.multiThreadedBake).toBool();
+    m_settings.bakeBlockSize = settings.value("ao/bakeBlockSize", m_settings.bakeBlockSize).toInt();
+    m_settings.cacheAccelerationStructure = settings.value("ao/cacheAccelerationStructure", m_settings.cacheAccelerationStructure).toBool();
+    m_settings.gpuComputePreview = settings.value("ao/gpuComputePreview", m_settings.gpuComputePreview).toBool();
     m_settings.textureResolution = settings.value("output/resolution", m_settings.textureResolution).toInt();
     m_settings.textureFormat = settings.value("output/format", m_settings.textureFormat).toString();
     m_settings.textureBitDepth = settings.value("output/bitDepth", m_settings.textureBitDepth).toString();
@@ -2329,6 +3111,11 @@ void MainWindow::saveAppSettings() const {
     settings.setValue("ao/samples", m_settings.sampleCount);
     settings.setValue("ao/rayDistance", m_settings.rayDistance);
     settings.setValue("ao/detailPreserve", m_settings.detailPreserve);
+    settings.setValue("ao/accelerationMode", m_settings.accelerationMode);
+    settings.setValue("ao/multiThreadedBake", m_settings.multiThreadedBake);
+    settings.setValue("ao/bakeBlockSize", m_settings.bakeBlockSize);
+    settings.setValue("ao/cacheAccelerationStructure", m_settings.cacheAccelerationStructure);
+    settings.setValue("ao/gpuComputePreview", m_settings.gpuComputePreview);
     settings.setValue("output/resolution", m_settings.textureResolution);
     settings.setValue("output/format", m_settings.textureFormat);
     settings.setValue("output/bitDepth", m_settings.textureBitDepth);
@@ -2426,6 +3213,11 @@ QJsonObject MainWindow::saveProjectJson() const {
     settingsObj["keepSmoothingGroups"] = m_settings.keepSmoothingGroups;
     settingsObj["keepUVs"] = m_settings.keepUVs;
     settingsObj["adaptiveSampling"] = m_settings.adaptiveSampling;
+    settingsObj["accelerationMode"] = m_settings.accelerationMode;
+    settingsObj["multiThreadedBake"] = m_settings.multiThreadedBake;
+    settingsObj["bakeBlockSize"] = m_settings.bakeBlockSize;
+    settingsObj["cacheAccelerationStructure"] = m_settings.cacheAccelerationStructure;
+    settingsObj["gpuComputePreview"] = m_settings.gpuComputePreview;
     root["bakeSettings"] = settingsObj;
     root["aoSettings"] = settingsObj;
 
@@ -2550,6 +3342,11 @@ bool MainWindow::restoreProjectJson(const QJsonObject& root) {
         m_settings.keepSmoothingGroups = settingsObj.value("keepSmoothingGroups").toBool(m_settings.keepSmoothingGroups);
         m_settings.keepUVs = settingsObj.value("keepUVs").toBool(m_settings.keepUVs);
         m_settings.adaptiveSampling = settingsObj.value("adaptiveSampling").toBool(m_settings.adaptiveSampling);
+        m_settings.accelerationMode = settingsObj.value("accelerationMode").toString(m_settings.accelerationMode);
+        m_settings.multiThreadedBake = settingsObj.value("multiThreadedBake").toBool(m_settings.multiThreadedBake);
+        m_settings.bakeBlockSize = settingsObj.value("bakeBlockSize").toInt(m_settings.bakeBlockSize);
+        m_settings.cacheAccelerationStructure = settingsObj.value("cacheAccelerationStructure").toBool(m_settings.cacheAccelerationStructure);
+        m_settings.gpuComputePreview = settingsObj.value("gpuComputePreview").toBool(m_settings.gpuComputePreview);
     }
 
     m_scene = loadedScene;

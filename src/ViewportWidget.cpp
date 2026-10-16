@@ -5,7 +5,11 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPen>
+#include <QLineF>
+#include <QLinearGradient>
+#include <QRadialGradient>
 #include <QWheelEvent>
 #include <algorithm>
 #include <cmath>
@@ -15,6 +19,18 @@ namespace {
 constexpr float kPi = 3.14159265358979323846f;
 float degToRad(float degrees) { return degrees * kPi / 180.0f; }
 float clamp01(float v) { return std::max(0.0f, std::min(1.0f, v)); }
+int blendChannelValue(int base, int paint, const QString& mode) {
+    if (mode == QStringLiteral("相加")) return std::min(255, base + paint);
+    if (mode == QStringLiteral("相减")) return std::max(0, base - paint);
+    if (mode == QStringLiteral("正片叠底") || mode == QStringLiteral("相乘")) return base * paint / 255;
+    if (mode == QStringLiteral("滤色")) return 255 - (255 - base) * (255 - paint) / 255;
+    if (mode == QStringLiteral("覆盖") || mode == QStringLiteral("叠加")) {
+        return base < 128 ? (2 * base * paint / 255) : (255 - 2 * (255 - base) * (255 - paint) / 255);
+    }
+    if (mode == QStringLiteral("变亮") || mode == QStringLiteral("最大值") || mode == QStringLiteral("加亮")) return std::max(base, paint);
+    if (mode == QStringLiteral("变暗") || mode == QStringLiteral("最小值")) return std::min(base, paint);
+    return paint;
+}
 quint64 changeKey(int meshIndex, int vertexIndex) {
     return (quint64(quint32(meshIndex)) << 32) | quint32(vertexIndex);
 }
@@ -24,6 +40,7 @@ ViewportWidget::ViewportWidget(QWidget* parent) : QOpenGLWidget(parent) {
     setMinimumHeight(420);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
+    m_frameTimer.start();
 }
 
 void ViewportWidget::setScene(SceneData* scene) {
@@ -47,6 +64,11 @@ void ViewportWidget::setBakeSettings(const BakeSettings& settings) {
 
 void ViewportWidget::setRealtimePreviewEnabled(bool enabled) {
     m_realtimePreview = enabled;
+    update();
+}
+
+void ViewportWidget::toggleRealtimePreview() {
+    m_realtimePreview = !m_realtimePreview;
     update();
 }
 
@@ -132,6 +154,16 @@ void ViewportWidget::setWireframeVisible(bool visible) {
     update();
 }
 
+void ViewportWidget::toggleWireframeVisible() {
+    m_wireframeVisible = !m_wireframeVisible;
+    update();
+}
+
+void ViewportWidget::toggleGridVisible() {
+    m_gridVisible = !m_gridVisible;
+    update();
+}
+
 void ViewportWidget::setDefaultMaterialColor(const QColor& color) {
     m_defaultMaterialColor = color;
     update();
@@ -147,6 +179,41 @@ void ViewportWidget::setVertexPaintEnabled(bool enabled) {
     m_useVertexColor = enabled ? true : m_useVertexColor;
     setCursor(enabled ? Qt::BlankCursor : Qt::ArrowCursor);
     update();
+}
+
+void ViewportWidget::toggleVertexPaintEnabled() {
+    setVertexPaintEnabled(!m_vertexPaintEnabled);
+    if (m_vertexPaintEnabled) {
+        m_paintEraseMode = false;
+        m_paintMode = 0;
+    }
+}
+
+void ViewportWidget::togglePaintEraseMode() {
+    setVertexPaintEnabled(true);
+    m_paintEraseMode = !m_paintEraseMode;
+    m_paintMode = 0;
+    update();
+}
+
+void ViewportWidget::restoreSelectionMode() {
+    m_vertexPaintEnabled = false;
+    m_paintEraseMode = false;
+    m_paintMode = 0;
+    setCursor(Qt::ArrowCursor);
+    update();
+}
+
+void ViewportWidget::setVisibleChannelPreset(int preset) {
+    if (preset == 1) {
+        setVisibleChannels(true, false, false);
+    } else if (preset == 2) {
+        setVisibleChannels(false, true, false);
+    } else if (preset == 3) {
+        setVisibleChannels(false, false, true);
+    } else {
+        setVisibleChannels(true, true, true);
+    }
 }
 
 void ViewportWidget::setPaintEraseMode(bool enabled) {
@@ -207,6 +274,14 @@ void ViewportWidget::setVisibleChannels(bool red, bool green, bool blue) {
     m_showGreenChannel = green;
     m_showBlueChannel = blue;
     update();
+}
+
+void ViewportWidget::setDisplayChannelMode(const QString& mode) {
+    m_displayChannelMode = mode;
+    if (mode == QStringLiteral("仅显示R")) setVisibleChannels(true, false, false);
+    else if (mode == QStringLiteral("仅显示G")) setVisibleChannels(false, true, false);
+    else if (mode == QStringLiteral("仅显示B")) setVisibleChannels(false, false, true);
+    else setVisibleChannels(true, true, true);
 }
 
 void ViewportWidget::setIgnoreBackfaces(bool enabled) {
@@ -456,7 +531,106 @@ ViewportWidget::ProjectedVertex ViewportWidget::projectVertex(const QVector3D& w
     return {screen, z, cam};
 }
 
+void ViewportWidget::updateBrushSurfacePreview(const QPoint& pos) {
+    m_brushSurfaceHit = false;
+    m_brushSurfaceCenter = QPointF(pos);
+    m_brushSurfaceRadius = m_paintRadius;
+    if (!m_scene || m_scene->empty()) return;
+
+    float bestDepth = 1e9f;
+    const QPointF cursor(pos);
+    for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
+        const auto& mesh = m_scene->meshes[meshIndex];
+        if (!mesh.visible) continue;
+        if (m_selectedMesh >= 0 && meshIndex != m_selectedMesh) continue;
+        for (const auto& f : mesh.faces) {
+            if (f.i0 < 0 || f.i1 < 0 || f.i2 < 0 || f.i0 >= mesh.vertices.size() || f.i1 >= mesh.vertices.size() || f.i2 >= mesh.vertices.size()) continue;
+            const auto p0 = projectVertex(mesh.vertices[f.i0].position);
+            const auto p1 = projectVertex(mesh.vertices[f.i1].position);
+            const auto p2 = projectVertex(mesh.vertices[f.i2].position);
+            if (p0.camera.z() > -0.02f || p1.camera.z() > -0.02f || p2.camera.z() > -0.02f) continue;
+            if (!pointInTriangle(cursor, p0.screen, p1.screen, p2.screen)) continue;
+            const float depth = (p0.depth + p1.depth + p2.depth) / 3.0f;
+            if (depth < bestDepth) {
+                bestDepth = depth;
+                m_brushSurfaceHit = true;
+                m_brushSurfaceCenter = (p0.screen + p1.screen + p2.screen) / 3.0;
+                m_brushSurfaceRadius = m_paintRadius;
+                m_lastAffectedMesh = meshIndex;
+            }
+        }
+    }
+}
+
+void ViewportWidget::drawViewportBackground(QPainter& p) const {
+    QLinearGradient bg(rect().topLeft(), rect().bottomLeft());
+    bg.setColorAt(0.0, QColor(22, 27, 34));
+    bg.setColorAt(0.55, QColor(30, 35, 42));
+    bg.setColorAt(1.0, QColor(18, 22, 28));
+    p.fillRect(rect(), bg);
+}
+
+void ViewportWidget::drawGroundShadow(QPainter& p, const QVector<DrawTriangle>& triangles) const {
+    if (triangles.isEmpty()) return;
+    QRectF bounds;
+    for (const auto& t : triangles) {
+        bounds |= QRectF(t.a, QSizeF(1, 1));
+        bounds |= QRectF(t.b, QSizeF(1, 1));
+        bounds |= QRectF(t.c, QSizeF(1, 1));
+    }
+    if (!bounds.isValid()) return;
+    const QPointF center(bounds.center().x(), std::min<double>(height() - 90, bounds.bottom() + 26));
+    const float rx = std::clamp(float(bounds.width() * 0.36), 42.0f, float(width()) * 0.33f);
+    const float ry = std::clamp(float(bounds.height() * 0.075), 12.0f, 52.0f);
+    QRadialGradient shadow(center, rx);
+    shadow.setColorAt(0.0, QColor(0, 0, 0, 92));
+    shadow.setColorAt(0.65, QColor(0, 0, 0, 38));
+    shadow.setColorAt(1.0, QColor(0, 0, 0, 0));
+    p.save();
+    p.setPen(Qt::NoPen);
+    p.setBrush(shadow);
+    p.drawEllipse(center, rx, ry);
+    p.restore();
+}
+
+void ViewportWidget::drawAxisGizmo(QPainter& p) const {
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+    const QPointF origin(56, height() - 72);
+    struct Axis { QVector3D dir; QColor color; QString label; };
+    const QVector<Axis> axes = {
+        {QVector3D(1, 0, 0), QColor(235, 92, 92), "X"},
+        {QVector3D(0, 1, 0), QColor(94, 210, 118), "Y"},
+        {QVector3D(0, 0, 1), QColor(94, 154, 255), "Z"}
+    };
+    for (const auto& axis : axes) {
+        QVector3D cam = rotateDirectionToCamera(axis.dir).normalized();
+        QPointF end = origin + QPointF(cam.x() * 34.0f, -cam.y() * 34.0f);
+        p.setPen(QPen(axis.color, 3, Qt::SolidLine, Qt::RoundCap));
+        p.drawLine(origin, end);
+        p.setBrush(axis.color);
+        p.setPen(Qt::NoPen);
+        p.drawEllipse(end, 4, 4);
+        p.setPen(axis.color.lighter(130));
+        p.drawText(end + QPointF(6, -4), axis.label);
+    }
+    p.setBrush(QColor(210, 216, 224));
+    p.setPen(Qt::NoPen);
+    p.drawEllipse(origin, 4, 4);
+    p.restore();
+}
+
 QColor ViewportWidget::channelFilteredColor(const QColor& color) const {
+    if (m_displayChannelMode == QStringLiteral("仅显示灰度")) {
+        const int gray = qGray(color.rgb());
+        return QColor(gray, gray, gray, color.alpha());
+    }
+    if (m_displayChannelMode == QStringLiteral("仅显示A")) {
+        return QColor(color.alpha(), color.alpha(), color.alpha(), 255);
+    }
+    if (m_displayChannelMode == QStringLiteral("仅显示R")) return QColor(color.red(), color.red(), color.red(), color.alpha());
+    if (m_displayChannelMode == QStringLiteral("仅显示G")) return QColor(color.green(), color.green(), color.green(), color.alpha());
+    if (m_displayChannelMode == QStringLiteral("仅显示B")) return QColor(color.blue(), color.blue(), color.blue(), color.alpha());
     return QColor(
         m_showRedChannel ? color.red() : 0,
         m_showGreenChannel ? color.green() : 0,
@@ -497,9 +671,11 @@ QColor ViewportWidget::previewColor(const MeshData& mesh, const Vertex& v, int m
     if (m_realtimePreview && (m_displayMode == QStringLiteral("AO 预览") || m_displayMode == QStringLiteral("AO 贴图预览") || m_displayMode == QStringLiteral("烘焙误差显示"))) {
         QVector3D n = v.normal.lengthSquared() > 0.00001f ? v.normal.normalized() : QVector3D(0, 1, 0);
         const float upward = clamp01((n.y() + 1.0f) * 0.5f);
+        const float facing = clamp01(-rotateDirectionToCamera(n).z());
         float cavity = std::pow(1.0f - upward, std::max(0.2f, m_settings.transitionContrast));
         cavity = cavity * m_settings.aoStrength;
         float ao = 1.0f - cavity;
+        ao *= 0.72f + facing * 0.28f;
         ao = m_settings.darkest + (m_settings.brightest - m_settings.darkest) * clamp01(ao);
         const QColor bounce = m_settings.groundBounceColor;
         const float bounceAmount = clamp01(m_settings.groundBounceStrength * upward * 0.35f);
@@ -557,52 +733,74 @@ void ViewportWidget::drawOverlay(QPainter& p) const {
         .arg(m_scene ? m_scene->faceCount() : 0)
         .arg(selected));
     p.drawText(14, height() - 42, "Maya 操作：Alt+左键旋转 / Alt+中键平移 / Alt+右键缩放 / 滚轮缩放 / F 重置视图 / 鼠标左键点选模型");
-    p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    顶点色：%3    绘制：%4    半径：%5    硬度：%6    压力：%7    镜像：%8    法线衰减：%9    背面忽略：%10")
+    p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    顶点色：%3    绘制：%4    半径：%5    硬度：%6    影响点：%7    FPS：%8")
         .arg(m_realtimePreview ? "开启" : "关闭")
         .arg(m_wireframeVisible ? "开启" : "关闭")
         .arg(m_useVertexColor ? "开启" : "关闭")
         .arg(m_vertexPaintEnabled ? (m_paintEraseMode ? "擦除" : (m_paintMode == 2 ? "填充" : "画笔")) : "关闭")
         .arg(int(m_paintRadius))
         .arg(QString::number(m_paintHardness, 'f', 2))
-        .arg(m_pressureSimulation ? "开启" : "关闭")
-        .arg(m_mirrorPainting ? "开启" : "关闭")
-        .arg(m_normalFalloff ? "开启" : "关闭")
-        .arg(m_ignoreBackfaces ? "开启" : "关闭"));
+        .arg(m_lastAffectedVertices)
+        .arg(QString::number(m_fps, 'f', 1)));
+
+    drawAxisGizmo(p);
+
     if (m_vertexPaintEnabled) {
         p.setRenderHint(QPainter::Antialiasing, true);
         const QPoint c = mapFromGlobal(QCursor::pos());
-        if (rect().contains(c)) {
+        const QPointF center = m_brushSurfaceHit ? m_brushSurfaceCenter : QPointF(c);
+        if (rect().contains(c) || rect().contains(center.toPoint())) {
             const QColor outer = m_paintEraseMode ? QColor(255, 112, 112) : QColor(92, 174, 255);
+            p.setBrush(QColor(outer.red(), outer.green(), outer.blue(), m_activeButton == Qt::LeftButton ? 42 : 18));
+            p.setPen(QPen(outer, m_brushSurfaceHit ? 2.6 : 1.6));
+            p.drawEllipse(center, m_brushSurfaceRadius, m_brushSurfaceRadius * (m_brushSurfaceHit ? 0.42 : 1.0));
             p.setBrush(Qt::NoBrush);
-            p.setPen(QPen(outer, 2));
-            p.drawEllipse(QPointF(c), m_paintRadius, m_paintRadius);
-            p.setPen(QPen(QColor(255, 255, 255, 150), 1, Qt::DashLine));
-            p.drawEllipse(QPointF(c), std::max(1.0f, m_paintRadius * m_paintHardness), std::max(1.0f, m_paintRadius * m_paintHardness));
-            p.drawLine(QPointF(c.x() - 5, c.y()), QPointF(c.x() + 5, c.y()));
-            p.drawLine(QPointF(c.x(), c.y() - 5), QPointF(c.x(), c.y() + 5));
+            p.setPen(QPen(QColor(255, 255, 255, 165), 1, Qt::DashLine));
+            const float hardRadius = std::max(1.0f, m_brushSurfaceRadius * m_paintHardness);
+            p.drawEllipse(center, hardRadius, hardRadius * (m_brushSurfaceHit ? 0.42 : 1.0));
+            p.setPen(QPen(QColor(255, 255, 255, 190), 1));
+            p.drawLine(QPointF(center.x() - 5, center.y()), QPointF(center.x() + 5, center.y()));
+            p.drawLine(QPointF(center.x(), center.y() - 5), QPointF(center.x(), center.y() + 5));
+            if (m_activeButton == Qt::LeftButton) {
+                p.setPen(QPen(QColor(255, 220, 88, 190), 1));
+                p.drawEllipse(center, m_brushSurfaceRadius * 1.16f, m_brushSurfaceRadius * (m_brushSurfaceHit ? 0.50f : 1.16f));
+            }
         }
     }
     p.restore();
 }
 
 void ViewportWidget::paintGL() {
+    const qint64 elapsed = m_frameTimer.isValid() ? m_frameTimer.restart() : 0;
+    if (elapsed > 0) {
+        m_lastFrameMs = double(elapsed);
+        const double instantFps = 1000.0 / std::max(1.0, m_lastFrameMs);
+        m_fps = m_fps <= 0.1 ? instantFps : (m_fps * 0.88 + instantFps * 0.12);
+    } else {
+        m_frameTimer.start();
+    }
+
     QPainter p(this);
-    p.fillRect(rect(), QColor(30, 35, 42));
+    drawViewportBackground(p);
     p.setRenderHint(QPainter::Antialiasing, true);
 
     if (!m_scene || m_scene->empty()) {
+        drawAxisGizmo(p);
         p.setPen(QColor(215, 221, 229));
         p.drawText(rect(), Qt::AlignCenter, "导入 OBJ / FBX / GLB 模型后在此显示 3D 视口");
         return;
     }
 
-    drawGrid(p);
+    if (m_gridVisible) {
+        drawGrid(p);
+    }
 
     QVector<DrawTriangle> triangles;
     triangles.reserve(m_scene->faceCount());
 
     for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
         const auto& mesh = m_scene->meshes[meshIndex];
+        if (!mesh.visible) continue;
         for (const auto& f : mesh.faces) {
             if (f.i0 < 0 || f.i1 < 0 || f.i2 < 0 || f.i0 >= mesh.vertices.size() || f.i1 >= mesh.vertices.size() || f.i2 >= mesh.vertices.size()) {
                 continue;
@@ -615,7 +813,9 @@ void ViewportWidget::paintGL() {
             }
             QColor color = previewColor(mesh, mesh.vertices[f.i0], meshIndex);
             color.setAlpha(meshIndex == m_selectedMesh ? 245 : 210);
-            triangles.push_back({meshIndex, p0.screen, p1.screen, p2.screen, (p0.depth + p1.depth + p2.depth) / 3.0f, color});
+            const QPointF brushCenter = (p0.screen + p1.screen + p2.screen) / 3.0;
+            const float brushScreenRadius = std::max(2.0f, (QLineF(p0.screen, p1.screen).length() + QLineF(p1.screen, p2.screen).length() + QLineF(p2.screen, p0.screen).length()) / 9.0f);
+            triangles.push_back({meshIndex, p0.screen, p1.screen, p2.screen, brushCenter, brushScreenRadius, false, (p0.depth + p1.depth + p2.depth) / 3.0f, color});
         }
     }
 
@@ -624,9 +824,24 @@ void ViewportWidget::paintGL() {
     });
 
     p.setPen(Qt::NoPen);
+    drawGroundShadow(p, triangles);
     for (const auto& t : triangles) {
         p.setBrush(t.color);
         p.drawPolygon(QPolygonF({t.a, t.b, t.c}));
+    }
+
+    if (m_vertexPaintEnabled && m_brushSurfaceHit) {
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(QPen(QColor(92, 174, 255, 75), 1));
+        p.setBrush(QColor(92, 174, 255, 28));
+        for (const auto& t : triangles) {
+            const float d = QLineF(t.brushCenter, m_brushSurfaceCenter).length();
+            if (d <= m_paintRadius + t.brushRadius) {
+                p.drawPolygon(QPolygonF({t.a, t.b, t.c}));
+            }
+        }
+        p.restore();
     }
 
     if (m_wireframeVisible) {
@@ -644,43 +859,14 @@ void ViewportWidget::paintGL() {
 }
 
 QColor ViewportWidget::blendPaintColor(const QColor& base, const QColor& paint, float alpha) const {
-    alpha = std::clamp(alpha, 0.0f, 1.0f);
-    if (m_paintBlendMode == QStringLiteral("正片叠底") || m_paintBlendMode == QStringLiteral("相乘")) {
-        return QColor(
-            std::clamp(int(base.red() * (1.0f - alpha) + (base.red() * paint.red() / 255) * alpha), 0, 255),
-            std::clamp(int(base.green() * (1.0f - alpha) + (base.green() * paint.green() / 255) * alpha), 0, 255),
-            std::clamp(int(base.blue() * (1.0f - alpha) + (base.blue() * paint.blue() / 255) * alpha), 0, 255),
-            255
-        );
-    }
-    if (m_paintBlendMode == QStringLiteral("滤色")) {
-        return QColor(
-            std::clamp(int(base.red() * (1.0f - alpha) + (255 - (255 - base.red()) * (255 - paint.red()) / 255) * alpha), 0, 255),
-            std::clamp(int(base.green() * (1.0f - alpha) + (255 - (255 - base.green()) * (255 - paint.green()) / 255) * alpha), 0, 255),
-            std::clamp(int(base.blue() * (1.0f - alpha) + (255 - (255 - base.blue()) * (255 - paint.blue()) / 255) * alpha), 0, 255),
-            255
-        );
-    }
-    if (m_paintBlendMode == QStringLiteral("叠加") || m_paintBlendMode == QStringLiteral("加亮")) {
-        return QColor(
-            std::clamp(int(base.red() * (1.0f - alpha) + std::min(255, base.red() + paint.red()) * alpha), 0, 255),
-            std::clamp(int(base.green() * (1.0f - alpha) + std::min(255, base.green() + paint.green()) * alpha), 0, 255),
-            std::clamp(int(base.blue() * (1.0f - alpha) + std::min(255, base.blue() + paint.blue()) * alpha), 0, 255),
-            255
-        );
-    }
-    if (m_paintBlendMode == QStringLiteral("变暗")) {
-        return QColor(
-            std::clamp(int(base.red() * (1.0f - alpha) + std::min(base.red(), paint.red()) * alpha), 0, 255),
-            std::clamp(int(base.green() * (1.0f - alpha) + std::min(base.green(), paint.green()) * alpha), 0, 255),
-            std::clamp(int(base.blue() * (1.0f - alpha) + std::min(base.blue(), paint.blue()) * alpha), 0, 255),
-            255
-        );
-    }
+    alpha = std::clamp(alpha * m_layerOpacity, 0.0f, 1.0f);
+    const int r = blendChannelValue(base.red(), paint.red(), m_paintBlendMode);
+    const int g = blendChannelValue(base.green(), paint.green(), m_paintBlendMode);
+    const int b = blendChannelValue(base.blue(), paint.blue(), m_paintBlendMode);
     return QColor(
-        std::clamp(int(base.red() * (1.0f - alpha) + paint.red() * alpha), 0, 255),
-        std::clamp(int(base.green() * (1.0f - alpha) + paint.green() * alpha), 0, 255),
-        std::clamp(int(base.blue() * (1.0f - alpha) + paint.blue() * alpha), 0, 255),
+        std::clamp(int(base.red() * (1.0f - alpha) + r * alpha), 0, 255),
+        std::clamp(int(base.green() * (1.0f - alpha) + g * alpha), 0, 255),
+        std::clamp(int(base.blue() * (1.0f - alpha) + b * alpha), 0, 255),
         255
     );
 }
@@ -801,6 +987,7 @@ void ViewportWidget::paintVertexAt(const QPoint& pos) {
     for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
         if (targetMesh >= 0 && meshIndex != targetMesh) continue;
         auto& mesh = m_scene->meshes[meshIndex];
+        if (!mesh.visible) continue;
         bool meshChanged = false;
         for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
             auto& vertex = mesh.vertices[vertexIndex];
@@ -851,6 +1038,7 @@ void ViewportWidget::paintVertexAt(const QPoint& pos) {
 
     if (changed) {
         m_useVertexColor = true;
+        m_lastAffectedVertices = m_pendingStroke.size();
         update();
     }
 }
@@ -863,6 +1051,8 @@ void ViewportWidget::fillSelectedMesh() {
     for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
         if (targetMesh >= 0 && meshIndex != targetMesh) continue;
         auto& mesh = m_scene->meshes[meshIndex];
+        if (!mesh.visible) continue;
+        bool meshChanged = false;
         for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
             auto& vertex = mesh.vertices[vertexIndex];
             const QColor src = vertex.color;
@@ -872,8 +1062,9 @@ void ViewportWidget::fillSelectedMesh() {
             recordColorChange(meshIndex, vertexIndex, src, finalColor);
             vertex.color = finalColor;
             changed = true;
+            meshChanged = true;
         }
-        if (changed) mesh.hasVertexColor = true;
+        if (meshChanged) mesh.hasVertexColor = true;
     }
     if (changed) {
         m_useVertexColor = true;
@@ -913,6 +1104,101 @@ void ViewportWidget::clearVertexColors() {
     }
 }
 
+void ViewportWidget::clearCurrentLayer() {
+    clearVertexColors();
+}
+
+void ViewportWidget::clearSelectedMeshVertexColors() {
+    if (!m_scene || m_scene->empty() || m_selectedMesh < 0 || m_selectedMesh >= m_scene->meshes.size()) return;
+    beginStroke();
+    bool changed = false;
+    auto& mesh = m_scene->meshes[m_selectedMesh];
+    for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
+        auto& vertex = mesh.vertices[vertexIndex];
+        const QColor src = vertex.color;
+        const QColor dst(255, 255, 255, 255);
+        if (src == dst) continue;
+        recordColorChange(m_selectedMesh, vertexIndex, src, dst);
+        vertex.color = dst;
+        changed = true;
+    }
+    mesh.hasVertexColor = false;
+    if (changed) {
+        update();
+        commitPendingStroke();
+    } else {
+        m_pendingStroke.clear();
+        m_pendingStrokeIndex.clear();
+        m_strokeActive = false;
+    }
+}
+
+void ViewportWidget::clearCurrentChannel() {
+    if (!m_scene || m_scene->empty()) return;
+    beginStroke();
+    bool changed = false;
+    const int targetMesh = m_selectedMesh;
+    for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
+        if (targetMesh >= 0 && meshIndex != targetMesh) continue;
+        auto& mesh = m_scene->meshes[meshIndex];
+        for (int vertexIndex = 0; vertexIndex < mesh.vertices.size(); ++vertexIndex) {
+            auto& vertex = mesh.vertices[vertexIndex];
+            const QColor src = vertex.color;
+            QColor dst = src;
+            if (m_showRedChannel) dst.setRed(255);
+            if (m_showGreenChannel) dst.setGreen(255);
+            if (m_showBlueChannel) dst.setBlue(255);
+            if (dst == src) continue;
+            recordColorChange(meshIndex, vertexIndex, src, dst);
+            vertex.color = dst;
+            changed = true;
+        }
+        refreshMeshColorFlags({meshIndex});
+    }
+    if (changed) {
+        update();
+        commitPendingStroke();
+    } else {
+        m_pendingStroke.clear();
+        m_pendingStrokeIndex.clear();
+        m_strokeActive = false;
+    }
+}
+
+void ViewportWidget::setMeshVisible(int meshIndex, bool visible) {
+    if (!m_scene || meshIndex < 0 || meshIndex >= m_scene->meshes.size()) return;
+    m_scene->meshes[meshIndex].visible = visible;
+    update();
+}
+
+void ViewportWidget::showOnlyMesh(int meshIndex) {
+    if (!m_scene || meshIndex < 0 || meshIndex >= m_scene->meshes.size()) return;
+    for (int i = 0; i < m_scene->meshes.size(); ++i) m_scene->meshes[i].visible = (i == meshIndex);
+    m_selectedMesh = meshIndex;
+    update();
+}
+
+void ViewportWidget::deleteMesh(int meshIndex) {
+    if (!m_scene || meshIndex < 0 || meshIndex >= m_scene->meshes.size()) return;
+    m_scene->meshes.removeAt(meshIndex);
+    if (m_selectedMesh == meshIndex) m_selectedMesh = -1;
+    else if (m_selectedMesh > meshIndex) --m_selectedMesh;
+    updateBounds();
+    update();
+    emit sceneModified();
+}
+
+void ViewportWidget::duplicateMesh(int meshIndex) {
+    if (!m_scene || meshIndex < 0 || meshIndex >= m_scene->meshes.size()) return;
+    MeshData copy = m_scene->meshes[meshIndex];
+    copy.name += QStringLiteral("_copy");
+    m_scene->meshes.insert(meshIndex + 1, copy);
+    m_selectedMesh = meshIndex + 1;
+    updateBounds();
+    update();
+    emit sceneModified();
+}
+
 void ViewportWidget::mousePressEvent(QMouseEvent* event) {
     setFocus();
     m_lastMousePos = event->pos();
@@ -920,6 +1206,7 @@ void ViewportWidget::mousePressEvent(QMouseEvent* event) {
     m_activeButton = event->button();
     m_dragged = false;
     if (m_vertexPaintEnabled && event->button() == Qt::LeftButton && !(event->modifiers() & Qt::AltModifier)) {
+        updateBrushSurfacePreview(event->pos());
         beginStroke();
         paintVertexAt(event->pos());
         m_dragged = true;
@@ -934,6 +1221,10 @@ void ViewportWidget::mouseMoveEvent(QMouseEvent* event) {
     }
 
     const bool mayaNav = event->modifiers() & Qt::AltModifier;
+    if (m_vertexPaintEnabled && !mayaNav) {
+        updateBrushSurfacePreview(event->pos());
+        update();
+    }
     if (m_vertexPaintEnabled && (event->buttons() & Qt::LeftButton) && !mayaNav) {
         paintVertexAt(event->pos());
         m_lastMousePos = event->pos();
@@ -960,6 +1251,7 @@ void ViewportWidget::mouseMoveEvent(QMouseEvent* event) {
 
 void ViewportWidget::mouseReleaseEvent(QMouseEvent* event) {
     if (m_vertexPaintEnabled && event->button() == Qt::LeftButton && !(event->modifiers() & Qt::AltModifier)) {
+        m_lastAffectedVertices = m_pendingStroke.size();
         commitPendingStroke();
     }
     const bool clickLike = !m_dragged && (event->pos() - m_pressMousePos).manhattanLength() < 4;
@@ -1000,6 +1292,41 @@ void ViewportWidget::keyPressEvent(QKeyEvent* event) {
         event->accept();
         return;
     }
+    if (event->key() == Qt::Key_B && event->modifiers() == Qt::NoModifier) {
+        toggleVertexPaintEnabled();
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_E && event->modifiers() == Qt::NoModifier) {
+        togglePaintEraseMode();
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_G && event->modifiers() == Qt::NoModifier) {
+        toggleGridVisible();
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_W && event->modifiers() == Qt::NoModifier) {
+        toggleWireframeVisible();
+        event->accept();
+        return;
+    }
+    if (event->key() >= Qt::Key_1 && event->key() <= Qt::Key_4 && event->modifiers() == Qt::NoModifier) {
+        setVisibleChannelPreset(event->key() - Qt::Key_1);
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_Q && event->modifiers() == Qt::NoModifier) {
+        restoreSelectionMode();
+        event->accept();
+        return;
+    }
+    if (event->key() == Qt::Key_Space && event->modifiers() == Qt::NoModifier) {
+        toggleRealtimePreview();
+        event->accept();
+        return;
+    }
     QOpenGLWidget::keyPressEvent(event);
 }
 
@@ -1020,6 +1347,7 @@ int ViewportWidget::pickMeshAt(const QPoint& pos) const {
     const QPointF p(pos);
     for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
         const auto& mesh = m_scene->meshes[meshIndex];
+        if (!mesh.visible) continue;
         for (const auto& f : mesh.faces) {
             if (f.i0 < 0 || f.i1 < 0 || f.i2 < 0 || f.i0 >= mesh.vertices.size() || f.i1 >= mesh.vertices.size() || f.i2 >= mesh.vertices.size()) {
                 continue;

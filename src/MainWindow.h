@@ -15,10 +15,12 @@
 #include <QCheckBox>
 #include <QPushButton>
 #include <QAction>
+#include <QPixmap>
 #include <QStringList>
 
 class QSplitter;
 class QGroupBox;
+class QTimer;
 
 class SliderRow : public QWidget {
     Q_OBJECT
@@ -73,6 +75,7 @@ private slots:
     void clearLog();
     void onMeshSelected(int meshIndex, const QString& meshName);
     void onSettingsChanged();
+    void keyPressEvent(QKeyEvent* event) override;
 
 private:
     void buildUi();
@@ -81,11 +84,18 @@ private:
     QWidget* buildSettingsPanel();
     QWidget* buildVertexPaintPanel();
     QWidget* buildOutputPanel();
+    QWidget* buildPreviewPanel();
+    QPixmap renderPreviewPixmap(const QString& mode, const QSize& size, bool before = false) const;
+    void updatePreviewThumbnail();
+    void openPreviewLarge();
+    void savePreviewImage();
+    void copyPreviewImage();
     void applyStyle();
     void refreshSceneInfo();
+    void showMeshContextMenu(const QPoint& pos);
     void log(const QString& text);
     void runBake(bool texture);
-    void recalculateNormals();
+    void recalculateNormals(bool splitNormals = false);
     QString outputBaseName(const QString& suffix) const;
     void markDirty(bool dirty = true);
     void updateWindowTitle();
@@ -127,7 +137,17 @@ private:
     QGroupBox* m_aoSettingsGroup = nullptr;
     QGroupBox* m_outputGroup = nullptr;
     QGroupBox* m_previewGroup = nullptr;
+    QGroupBox* m_previewPanelGroup = nullptr;
     QGroupBox* m_bakeOutputGroup = nullptr;
+    QWidget* m_previewImageBox = nullptr;
+    QPushButton* m_previewImage = nullptr;
+    QLabel* m_previewInfo = nullptr;
+    QComboBox* m_previewMode = nullptr;
+    QPushButton* m_previewCompareButton = nullptr;
+    QTimer* m_previewUpdateTimer = nullptr;
+    QPixmap m_currentPreviewPixmap;
+    QPixmap m_beforePreviewPixmap;
+    bool m_previewCompareEnabled = false;
     QWidget* m_rightPanel = nullptr;
     QWidget* m_leftPanel = nullptr;
     QLabel* m_modelInfo = nullptr;
@@ -146,14 +166,14 @@ private:
     QComboBox* m_splitMode = nullptr;
     QComboBox* m_vertexWriteMode = nullptr;
     QComboBox* m_bakeScope = nullptr;
-    QCheckBox* m_autoOpenOutputDir = nullptr;
+    QPushButton* m_autoOpenOutputDir = nullptr;
     QLabel* m_formatHint = nullptr;
     QLabel* m_statusSummary = nullptr;
     QAction* m_undoAction = nullptr;
     QAction* m_redoAction = nullptr;
     QMenu* m_recentFilesMenu = nullptr;
-    QCheckBox* m_ignoreBackfacesCheck = nullptr;
-    QCheckBox* m_lockRedCheck = nullptr;
-    QCheckBox* m_lockGreenCheck = nullptr;
-    QCheckBox* m_lockBlueCheck = nullptr;
+    QPushButton* m_ignoreBackfacesCheck = nullptr;
+    QPushButton* m_lockRedCheck = nullptr;
+    QPushButton* m_lockGreenCheck = nullptr;
+    QPushButton* m_lockBlueCheck = nullptr;
 };
