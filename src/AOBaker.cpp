@@ -623,7 +623,7 @@ void AOBaker::bakeToVertexColor(SceneData& scene, const BakeSettings& settings) 
         }
     }
 
-    const int total = std::max(1, jobs.size());
+    const int total = std::max(1, static_cast<int>(jobs.size()));
     const int threadCount = settings.multiThreadedBake ? std::max(1, QThread::idealThreadCount()) : 1;
     const int blockSize = std::max(64, settings.bakeBlockSize);
     const QString accelName = kdTree ? QStringLiteral("KD-Tree") : QStringLiteral("BVH");
@@ -643,9 +643,9 @@ void AOBaker::bakeToVertexColor(SceneData& scene, const BakeSettings& settings) 
                              settings.groundBounceColor.blueF() * 0.0722f;
 
     int done = 0;
-    for (int blockStart = 0; blockStart < jobs.size(); blockStart += blockSize) {
+    for (int blockStart = 0; blockStart < static_cast<int>(jobs.size()); blockStart += blockSize) {
         if (isCancelRequested()) break;
-        const int blockEnd = std::min(blockStart + blockSize, jobs.size());
+        const int blockEnd = std::min(blockStart + blockSize, static_cast<int>(jobs.size()));
         QVector<VertexBakeJob> blockJobs;
         blockJobs.reserve(blockEnd - blockStart);
         for (int i = blockStart; i < blockEnd; ++i) blockJobs.push_back(jobs[i]);
@@ -654,12 +654,13 @@ void AOBaker::bakeToVertexColor(SceneData& scene, const BakeSettings& settings) 
         results.reserve(blockJobs.size());
 
         if (threadCount > 1 && blockJobs.size() > 128) {
-            const int workerCount = std::min(threadCount, std::max(1, blockJobs.size() / 64));
-            QVector<std::future<QVector<VertexBakeResult>>> futures;
+            const int blockJobCount = static_cast<int>(blockJobs.size());
+            const int workerCount = std::min(threadCount, std::max(1, blockJobCount / 64));
+            std::vector<std::future<QVector<VertexBakeResult>>> futures;
             futures.reserve(workerCount);
             for (int worker = 0; worker < workerCount; ++worker) {
-                const int begin = worker * blockJobs.size() / workerCount;
-                const int end = (worker + 1) * blockJobs.size() / workerCount;
+                const int begin = worker * blockJobCount / workerCount;
+                const int end = (worker + 1) * blockJobCount / workerCount;
                 futures.push_back(std::async(std::launch::async, [&, begin, end]() {
                     QVector<VertexBakeResult> local;
                     local.reserve(end - begin);

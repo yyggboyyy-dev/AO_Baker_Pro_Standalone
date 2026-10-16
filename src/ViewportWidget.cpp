@@ -336,7 +336,7 @@ void ViewportWidget::pushVertexColorUndo(const QVector<QVector<QColor>>& beforeC
     for (int meshIndex = 0; meshIndex < m_scene->meshes.size() && meshIndex < beforeColors.size(); ++meshIndex) {
         const auto& mesh = m_scene->meshes[meshIndex];
         const auto& oldColors = beforeColors[meshIndex];
-        const int count = std::min(mesh.vertices.size(), oldColors.size());
+        const int count = std::min(static_cast<int>(mesh.vertices.size()), static_cast<int>(oldColors.size()));
         for (int vertexIndex = 0; vertexIndex < count; ++vertexIndex) {
             const QColor& oldColor = oldColors[vertexIndex];
             const QColor& newColor = mesh.vertices[vertexIndex].color;
@@ -814,7 +814,7 @@ void ViewportWidget::paintGL() {
             QColor color = previewColor(mesh, mesh.vertices[f.i0], meshIndex);
             color.setAlpha(meshIndex == m_selectedMesh ? 245 : 210);
             const QPointF brushCenter = (p0.screen + p1.screen + p2.screen) / 3.0;
-            const float brushScreenRadius = std::max(2.0f, (QLineF(p0.screen, p1.screen).length() + QLineF(p1.screen, p2.screen).length() + QLineF(p2.screen, p0.screen).length()) / 9.0f);
+            const float brushScreenRadius = std::max(2.0f, static_cast<float>((QLineF(p0.screen, p1.screen).length() + QLineF(p1.screen, p2.screen).length() + QLineF(p2.screen, p0.screen).length()) / 9.0));
             triangles.push_back({meshIndex, p0.screen, p1.screen, p2.screen, brushCenter, brushScreenRadius, false, (p0.depth + p1.depth + p2.depth) / 3.0f, color});
         }
     }
