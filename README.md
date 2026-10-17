@@ -140,3 +140,9 @@ src/
 - 启动时检测实际 OpenGL 上下文与 Compute Shader 编译结果；支持时状态栏显示 GPU Compute 状态，不支持或运行失败时回退到原 CPU 绘制路径。
 - 当前限制：GPU Compute 仅用于普通 3D 视口的顶点投影；静态顶点位置会缓存到 GPU，预览颜色仍由 CPU 每帧准备并上传；顶点绘制/笔刷命中仍使用 CPU 路径。AO 顶点烘焙与逐纹素 AO 烘焙仍是 CPU 实现，**不能视为 GPU AO 烘焙已完成**。
 - 需要桌面 OpenGL 4.3+ 驱动。当前开发容器缺少 Qt 6 开发包，无法在此完成 C++ 编译、Shader 实际编译或显卡运行时验证；请在 Windows 目标机验证后再作为稳定发行版使用。
+
+### V4 视口与设置布局修复
+- GPU Core Profile 绘制现在创建并绑定 VAO，避免 `glDrawArrays` 因未绑定 VAO 而失败。
+- GPU 绘制显式设置深度缓冲状态。
+- 右侧 AO/输出/预览面板采用可滚动容器，避免小窗口中设置行被挤压重叠。
+- 该修复仍需在目标 Windows GPU 上验证 Compute Shader 编译、模型显示和交互帧率。

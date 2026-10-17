@@ -30,6 +30,7 @@ private:
     unsigned int m_positionBuffer = 0;
     unsigned int m_colorBuffer = 0;
     unsigned int m_outputBuffer = 0;
+    unsigned int m_vertexArray = 0;
     int m_cachedVertexCount = -1;
     bool m_ready = false;
     QString m_status = QStringLiteral("GPU Compute 未初始化");

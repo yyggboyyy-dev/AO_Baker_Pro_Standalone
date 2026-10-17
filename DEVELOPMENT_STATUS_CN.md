@@ -66,3 +66,15 @@ cmake -S . -B build-audit -G Ninja -DCMAKE_BUILD_TYPE=Release
 - `TextureRasterizer.cpp` 原先将 `std::thread` 放进 `QVector`。Qt 容器在相关操作中要求元素可复制，而 `std::thread` 不可复制，导致 C2280。现改为 `std::vector<std::thread>`，显式启动并 join 线程。
 - 删除 CMake 命令行中未被项目使用的 `VCPKG_BUILD_TYPE`。该变量不是本项目的 CMake 选项；vcpkg triplet 继续由 `VCPKG_TARGET_TRIPLET=x64-windows-static` 控制。
 - 此修复针对日志中的编译错误；必须重新运行 Windows CI 才能确认是否还有后续编译或链接错误。
+
+## V4 截图反馈修复（2026-10-17）
+
+用户反馈 V3 在 OpenGL 4.3 Compute 已显示启用的情况下视口只显示网格、模型不可见，且右侧 AO 设置控件出现垂直挤压/叠压。
+
+修复：
+- GPU 渲染器创建、绑定并释放 Core Profile 必需的 VAO。原代码仅调用 `glDrawArrays` 而未绑定 VAO，在 Core Profile 下会触发 `GL_INVALID_OPERATION`，这是模型不可见的主要原因。
+- GPU 绘制前明确关闭 scissor、启用深度写入并清理深度缓冲，减少与 QPainter / QOpenGLWidget 状态交互造成的绘制问题。
+- 右侧设置列改为 `QScrollArea`，面板按自然高度布局，窗口高度不足时滚动而不是压缩 `QFormLayout` 行。
+- AO 表单增加行间距、长标签换行；滑块行设定最小高度；设置列保留 390px 内容宽度，狭窄时可水平滚动。
+
+验证边界：源码静态检查与 ZIP 完整性检查；当前环境没有完整 Qt 6/MSVC Windows 构建环境，因此 GPU 实际运行和 Windows 编译仍需在 CI/目标机验证。

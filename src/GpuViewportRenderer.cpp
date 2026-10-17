@@ -94,7 +94,10 @@ void main() { fragColor = (uWirePass != 0) ? vec4(0.28, 0.32, 0.38, 0.95) : vCol
     m_gl->glGenBuffers(1, &m_positionBuffer);
     m_gl->glGenBuffers(1, &m_colorBuffer);
     m_gl->glGenBuffers(1, &m_outputBuffer);
-    m_ready = m_positionBuffer != 0 && m_colorBuffer != 0 && m_outputBuffer != 0;
+    // Core-profile OpenGL requires a bound VAO even when using gl_VertexID
+    // and shader storage buffers without conventional vertex attributes.
+    m_gl->glGenVertexArrays(1, &m_vertexArray);
+    m_ready = m_positionBuffer != 0 && m_colorBuffer != 0 && m_outputBuffer != 0 && m_vertexArray != 0;
     m_status = m_ready ? QStringLiteral("GPU Compute 已启用（OpenGL %1.%2）").arg(f.majorVersion()).arg(f.minorVersion()) : QStringLiteral("GPU Compute 缓冲区创建失败");
     if (error) *error = m_status;
     return m_ready;
@@ -136,6 +139,11 @@ bool GpuViewportRenderer::render(const QVector<float>& positions, const QVector<
     m_compute->release();
 
     m_gl->glViewport(0, 0, width, height);
+    m_gl->glDisable(GL_SCISSOR_TEST);
+    m_gl->glDepthMask(GL_TRUE);
+    m_gl->glClearDepth(1.0);
+    m_gl->glClear(GL_DEPTH_BUFFER_BIT);
+    m_gl->glBindVertexArray(m_vertexArray);
     m_gl->glEnable(GL_DEPTH_TEST);
     m_gl->glDepthFunc(GL_LEQUAL);
     m_gl->glEnable(GL_BLEND);
@@ -156,6 +164,7 @@ bool GpuViewportRenderer::render(const QVector<float>& positions, const QVector<
     }
     m_draw->release();
     m_gl->glDisable(GL_DEPTH_TEST);
+    m_gl->glBindVertexArray(0);
     m_gl->glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     return true;
 }
@@ -165,8 +174,10 @@ void GpuViewportRenderer::release() {
         if (m_positionBuffer) m_gl->glDeleteBuffers(1, &m_positionBuffer);
         if (m_colorBuffer) m_gl->glDeleteBuffers(1, &m_colorBuffer);
         if (m_outputBuffer) m_gl->glDeleteBuffers(1, &m_outputBuffer);
+        if (m_vertexArray) m_gl->glDeleteVertexArrays(1, &m_vertexArray);
     }
     m_positionBuffer = m_colorBuffer = m_outputBuffer = 0;
+    m_vertexArray = 0;
     m_cachedVertexCount = -1;
     m_ready = false;
     m_compute.reset();

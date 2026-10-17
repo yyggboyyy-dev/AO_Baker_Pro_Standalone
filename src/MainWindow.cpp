@@ -42,6 +42,8 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSplitter>
+#include <QScrollArea>
+#include <QFrame>
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QTableWidget>
@@ -357,6 +359,8 @@ SliderRow::SliderRow(float min, float max, float value, int decimals, QWidget* p
     m_slider->setValue(int(value * m_scale));
     m_edit = new QLineEdit(QString::number(value, 'f', decimals), this);
     m_edit->setFixedWidth(68);
+    setMinimumHeight(24);
+    m_slider->setMinimumHeight(20);
     auto* layout = new QHBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->addWidget(m_slider, 1);
@@ -697,20 +701,37 @@ void MainWindow::buildUi() {
     m_bakeOutputGroup = qobject_cast<QGroupBox*>(group("烘焙输出", bakePanel));
     centerLayout->addWidget(m_bakeOutputGroup, 1);
 
-    m_rightPanel = new QWidget(this);
-    auto* right = m_rightPanel;
+    // Keep the settings column scrollable and preserve each panel's natural
+    // height. On smaller windows the old splitter squeezed QFormLayout rows
+    // until labels and controls visually overlapped.
+    auto* rightScroll = new QScrollArea(this);
+    rightScroll->setWidgetResizable(true);
+    rightScroll->setFrameShape(QFrame::NoFrame);
+    rightScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    rightScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    rightScroll->setMinimumWidth(330);
+    auto* right = new QWidget(rightScroll);
+    right->setMinimumWidth(390);
+    m_rightPanel = rightScroll;
+    rightScroll->setWidget(right);
     auto* rightLayout = new QVBoxLayout(right);
+    rightLayout->setContentsMargins(4, 4, 4, 4);
+    rightLayout->setSpacing(8);
     m_aoSettingsGroup = qobject_cast<QGroupBox*>(buildSettingsPanel());
     m_outputGroup = qobject_cast<QGroupBox*>(buildOutputPanel());
     m_previewPanelGroup = qobject_cast<QGroupBox*>(buildPreviewPanel());
-    rightLayout->addWidget(m_aoSettingsGroup, 5);
-    rightLayout->addWidget(m_outputGroup, 2);
-    rightLayout->addWidget(m_previewPanelGroup, 2);
+    rightLayout->addWidget(m_aoSettingsGroup);
+    rightLayout->addWidget(m_outputGroup);
+    rightLayout->addWidget(m_previewPanelGroup);
+    m_aoSettingsGroup->setMinimumHeight(m_aoSettingsGroup->sizeHint().height());
+    m_outputGroup->setMinimumHeight(m_outputGroup->sizeHint().height());
+    m_previewPanelGroup->setMinimumHeight(m_previewPanelGroup->sizeHint().height());
+    right->setMinimumHeight(rightLayout->sizeHint().height() + 8);
 
     root->addWidget(paintColumn);
     root->addWidget(left);
     root->addWidget(center);
-    root->addWidget(right);
+    root->addWidget(rightScroll);
     root->setSizes({170, 250, 640, 360});
 
     m_statusSummary = new QLabel(this);
@@ -776,6 +797,9 @@ void MainWindow::keyPressEvent(QKeyEvent* event) {
 QWidget* MainWindow::buildSettingsPanel() {
     auto* box = new QGroupBox("AO 设置", this);
     auto* form = new QFormLayout(box);
+    form->setVerticalSpacing(6);
+    form->setHorizontalSpacing(8);
+    form->setRowWrapPolicy(QFormLayout::WrapLongRows);
     auto addSlider = [&](const QString& name, float min, float max, float initial, auto setter) {
         auto* row = new SliderRow(min, max, initial, 2, this);
         connect(row, &SliderRow::valueChanged, this, setter);
