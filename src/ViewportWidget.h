@@ -1,8 +1,10 @@
 #pragma once
 
 #include "ModelData.h"
+#include "GpuViewportRenderer.h"
 #include <QElapsedTimer>
 #include <QHash>
+#include <QPair>
 #include <QJsonObject>
 #include <QOpenGLWidget>
 #include <QPoint>
@@ -115,6 +117,12 @@ private:
     };
 
     SceneData* m_scene = nullptr;
+    GpuViewportRenderer m_gpuRenderer;
+    bool m_gpuViewportAvailable = false;
+    bool m_gpuGeometryDirty = true;
+    QVector<float> m_gpuPositionCache;
+    QVector<QPair<int, int>> m_gpuTriangleRefs;
+    QString m_gpuViewportStatus = QStringLiteral("GPU Compute 初始化中");
     BakeSettings m_settings;
     bool m_realtimePreview = true;
     bool m_orthographicView = false;
@@ -180,6 +188,7 @@ private:
 
     void resetCamera();
     void updateBounds();
+    void rebuildGpuGeometryCache();
     QVector3D rotateToCamera(const QVector3D& world) const;
     QVector3D rotateDirectionToCamera(const QVector3D& dir) const;
     QVector3D cameraRightWorld() const;

@@ -9,6 +9,8 @@
 #include <QPen>
 #include <QLineF>
 #include <QLinearGradient>
+#include <QOpenGLContext>
+#include <QOpenGLFunctions>
 #include <QRadialGradient>
 #include <QWheelEvent>
 #include <algorithm>
@@ -45,6 +47,9 @@ ViewportWidget::ViewportWidget(QWidget* parent) : QOpenGLWidget(parent) {
 
 void ViewportWidget::setScene(SceneData* scene) {
     m_scene = scene;
+    m_gpuGeometryDirty = true;
+    m_gpuPositionCache.clear();
+    m_gpuTriangleRefs.clear();
     m_selectedMesh = -1;
     m_undoStack.clear();
     m_redoStack.clear();
@@ -445,7 +450,39 @@ void ViewportWidget::restoreViewState(const QJsonObject& state) {
     update();
 }
 
-void ViewportWidget::initializeGL() {}
+void ViewportWidget::rebuildGpuGeometryCache() {
+    m_gpuPositionCache.clear();
+    m_gpuTriangleRefs.clear();
+    if (!m_scene) { m_gpuGeometryDirty = false; return; }
+    m_gpuPositionCache.reserve(m_scene->faceCount() * 12);
+    m_gpuTriangleRefs.reserve(m_scene->faceCount());
+    for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
+        const auto& mesh = m_scene->meshes[meshIndex];
+        if (!mesh.visible) continue;
+        for (const auto& face : mesh.faces) {
+            if (face.i0 < 0 || face.i1 < 0 || face.i2 < 0 || face.i0 >= mesh.vertices.size() || face.i1 >= mesh.vertices.size() || face.i2 >= mesh.vertices.size()) continue;
+            for (int vertexIndex : {face.i0, face.i1, face.i2}) {
+                const QVector3D& pos = mesh.vertices[vertexIndex].position;
+                m_gpuPositionCache << pos.x() << pos.y() << pos.z() << 1.0f;
+            }
+            m_gpuTriangleRefs.push_back(qMakePair(meshIndex, face.i0));
+        }
+    }
+    m_gpuGeometryDirty = false;
+}
+
+void ViewportWidget::initializeGL() {
+    QString error;
+    m_gpuViewportAvailable = m_gpuRenderer.initialize(&error);
+    m_gpuViewportStatus = error;
+    if (!m_gpuViewportAvailable) {
+        qWarning() << "AO Baker Pro viewport GPU fallback:" << error;
+    }
+    if (QOpenGLContext::currentContext()) {
+        auto* gl = QOpenGLContext::currentContext()->functions();
+        gl->glClearColor(0.07f, 0.09f, 0.12f, 1.0f);
+    }
+}
 void ViewportWidget::resizeGL(int, int) {}
 
 void ViewportWidget::updateBounds() {
@@ -733,6 +770,7 @@ void ViewportWidget::drawOverlay(QPainter& p) const {
         .arg(m_scene ? m_scene->faceCount() : 0)
         .arg(selected));
     p.drawText(14, height() - 42, "Maya 操作：Alt+左键旋转 / Alt+中键平移 / Alt+右键缩放 / 滚轮缩放 / F 重置视图 / 鼠标左键点选模型");
+    p.drawText(14, height() - 58, m_gpuViewportStatus);
     p.drawText(14, height() - 20, QString("实时预览：%1    线框：%2    顶点色：%3    绘制：%4    半径：%5    硬度：%6    影响点：%7    FPS：%8")
         .arg(m_realtimePreview ? "开启" : "关闭")
         .arg(m_wireframeVisible ? "开启" : "关闭")
@@ -796,41 +834,67 @@ void ViewportWidget::paintGL() {
     }
 
     QVector<DrawTriangle> triangles;
-    triangles.reserve(m_scene->faceCount());
-
-    for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
-        const auto& mesh = m_scene->meshes[meshIndex];
-        if (!mesh.visible) continue;
-        for (const auto& f : mesh.faces) {
-            if (f.i0 < 0 || f.i1 < 0 || f.i2 < 0 || f.i0 >= mesh.vertices.size() || f.i1 >= mesh.vertices.size() || f.i2 >= mesh.vertices.size()) {
-                continue;
+    QVector<float> gpuColors;
+    const bool useGpuFrame = m_gpuViewportAvailable && !m_vertexPaintEnabled;
+    bool gpuGeometryChangedThisFrame = false;
+    if (useGpuFrame) {
+        gpuGeometryChangedThisFrame = m_gpuGeometryDirty;
+        if (m_gpuGeometryDirty) rebuildGpuGeometryCache();
+        gpuColors.reserve(m_gpuPositionCache.size());
+        for (const auto& ref : m_gpuTriangleRefs) {
+            if (ref.first < 0 || ref.first >= m_scene->meshes.size()) continue;
+            const auto& mesh = m_scene->meshes[ref.first];
+            if (ref.second < 0 || ref.second >= mesh.vertices.size()) continue;
+            QColor color = previewColor(mesh, mesh.vertices[ref.second], ref.first);
+            color.setAlpha(ref.first == m_selectedMesh ? 245 : 210);
+            for (int i = 0; i < 3; ++i) gpuColors << color.redF() << color.greenF() << color.blueF() << color.alphaF();
+        }
+    } else {
+        triangles.reserve(m_scene->faceCount());
+        for (int meshIndex = 0; meshIndex < m_scene->meshes.size(); ++meshIndex) {
+            const auto& mesh = m_scene->meshes[meshIndex];
+            if (!mesh.visible) continue;
+            for (const auto& f : mesh.faces) {
+                if (f.i0 < 0 || f.i1 < 0 || f.i2 < 0 || f.i0 >= mesh.vertices.size() || f.i1 >= mesh.vertices.size() || f.i2 >= mesh.vertices.size()) continue;
+                const auto& v0 = mesh.vertices[f.i0];
+                const auto& v1 = mesh.vertices[f.i1];
+                const auto& v2 = mesh.vertices[f.i2];
+                const auto p0 = projectVertex(v0.position);
+                const auto p1 = projectVertex(v1.position);
+                const auto p2 = projectVertex(v2.position);
+                if (p0.camera.z() > -0.02f || p1.camera.z() > -0.02f || p2.camera.z() > -0.02f) continue;
+                QColor color = previewColor(mesh, v0, meshIndex);
+                color.setAlpha(meshIndex == m_selectedMesh ? 245 : 210);
+                const QPointF brushCenter = (p0.screen + p1.screen + p2.screen) / 3.0;
+                const float brushScreenRadius = std::max(2.0f, static_cast<float>((QLineF(p0.screen, p1.screen).length() + QLineF(p1.screen, p2.screen).length() + QLineF(p2.screen, p0.screen).length()) / 9.0));
+                triangles.push_back({meshIndex, p0.screen, p1.screen, p2.screen, brushCenter, brushScreenRadius, false, (p0.depth + p1.depth + p2.depth) / 3.0f, color});
             }
-            const auto p0 = projectVertex(mesh.vertices[f.i0].position);
-            const auto p1 = projectVertex(mesh.vertices[f.i1].position);
-            const auto p2 = projectVertex(mesh.vertices[f.i2].position);
-            if (p0.camera.z() > -0.02f || p1.camera.z() > -0.02f || p2.camera.z() > -0.02f) {
-                continue;
-            }
-            QColor color = previewColor(mesh, mesh.vertices[f.i0], meshIndex);
-            color.setAlpha(meshIndex == m_selectedMesh ? 245 : 210);
-            const QPointF brushCenter = (p0.screen + p1.screen + p2.screen) / 3.0;
-            const float brushScreenRadius = std::max(2.0f, static_cast<float>((QLineF(p0.screen, p1.screen).length() + QLineF(p1.screen, p2.screen).length() + QLineF(p2.screen, p0.screen).length()) / 9.0));
-            triangles.push_back({meshIndex, p0.screen, p1.screen, p2.screen, brushCenter, brushScreenRadius, false, (p0.depth + p1.depth + p2.depth) / 3.0f, color});
         }
     }
 
-    std::sort(triangles.begin(), triangles.end(), [](const DrawTriangle& lhs, const DrawTriangle& rhs){
-        return lhs.depth > rhs.depth;
-    });
-
-    p.setPen(Qt::NoPen);
-    drawGroundShadow(p, triangles);
-    for (const auto& t : triangles) {
-        p.setBrush(t.color);
-        p.drawPolygon(QPolygonF({t.a, t.b, t.c}));
+    if (useGpuFrame) {
+        p.beginNativePainting();
+        auto* gl = QOpenGLContext::currentContext()->functions();
+        gl->glClear(GL_DEPTH_BUFFER_BIT);
+        const qreal dpr = devicePixelRatioF();
+        const bool rendered = m_gpuRenderer.render(m_gpuPositionCache, gpuColors, gpuGeometryChangedThisFrame,
+            m_yaw, m_pitch, m_center, m_distance, m_zoom,
+            QPointF(m_pan.x() * dpr, m_pan.y() * dpr), m_orthographicView,
+            int(width() * dpr), int(height() * dpr), m_wireframeVisible);
+        p.endNativePainting();
+        if (!rendered) {
+            m_gpuViewportStatus = QStringLiteral("GPU Compute 渲染失败，正在回退 CPU");
+            m_gpuViewportAvailable = false;
+            update();
+        }
+    } else {
+        std::sort(triangles.begin(), triangles.end(), [](const DrawTriangle& lhs, const DrawTriangle& rhs){ return lhs.depth > rhs.depth; });
+        p.setPen(Qt::NoPen);
+        drawGroundShadow(p, triangles);
+        for (const auto& t : triangles) { p.setBrush(t.color); p.drawPolygon(QPolygonF({t.a, t.b, t.c})); }
     }
 
-    if (m_vertexPaintEnabled && m_brushSurfaceHit) {
+    if (!useGpuFrame && m_vertexPaintEnabled && m_brushSurfaceHit) {
         p.save();
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setPen(QPen(QColor(92, 174, 255, 75), 1));
@@ -844,7 +908,7 @@ void ViewportWidget::paintGL() {
         p.restore();
     }
 
-    if (m_wireframeVisible) {
+    if (!useGpuFrame && m_wireframeVisible) {
         p.setBrush(Qt::NoBrush);
         for (const auto& t : triangles) {
             const bool selected = t.meshIndex == m_selectedMesh;
@@ -1168,6 +1232,7 @@ void ViewportWidget::clearCurrentChannel() {
 void ViewportWidget::setMeshVisible(int meshIndex, bool visible) {
     if (!m_scene || meshIndex < 0 || meshIndex >= m_scene->meshes.size()) return;
     m_scene->meshes[meshIndex].visible = visible;
+    m_gpuGeometryDirty = true;
     update();
 }
 
@@ -1175,12 +1240,14 @@ void ViewportWidget::showOnlyMesh(int meshIndex) {
     if (!m_scene || meshIndex < 0 || meshIndex >= m_scene->meshes.size()) return;
     for (int i = 0; i < m_scene->meshes.size(); ++i) m_scene->meshes[i].visible = (i == meshIndex);
     m_selectedMesh = meshIndex;
+    m_gpuGeometryDirty = true;
     update();
 }
 
 void ViewportWidget::deleteMesh(int meshIndex) {
     if (!m_scene || meshIndex < 0 || meshIndex >= m_scene->meshes.size()) return;
     m_scene->meshes.removeAt(meshIndex);
+    m_gpuGeometryDirty = true;
     if (m_selectedMesh == meshIndex) m_selectedMesh = -1;
     else if (m_selectedMesh > meshIndex) --m_selectedMesh;
     updateBounds();
@@ -1193,6 +1260,7 @@ void ViewportWidget::duplicateMesh(int meshIndex) {
     MeshData copy = m_scene->meshes[meshIndex];
     copy.name += QStringLiteral("_copy");
     m_scene->meshes.insert(meshIndex + 1, copy);
+    m_gpuGeometryDirty = true;
     m_selectedMesh = meshIndex + 1;
     updateBounds();
     update();

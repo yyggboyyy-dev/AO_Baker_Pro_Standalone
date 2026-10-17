@@ -802,6 +802,14 @@ QWidget* MainWindow::buildSettingsPanel() {
     connect(samples, &QSpinBox::valueChanged, this, [this](int v){ m_settings.sampleCount = v; onSettingsChanged(); });
     form->addRow("射线数量", samples);
     addSlider("最大烘焙距离", 0.1f, 100, m_settings.rayDistance, [this](float v){ m_settings.rayDistance = v; onSettingsChanged(); });
+    addSlider("射线起点偏移（场景比例）", 0.00001f, 0.01f, m_settings.rayOriginOffset, [this](float v){ m_settings.rayOriginOffset = v; onSettingsChanged(); });
+    auto* padding = new QSpinBox(this);
+    padding->setRange(0, 64);
+    padding->setSuffix(" px");
+    padding->setValue(m_settings.uvPaddingPixels);
+    padding->setToolTip("UV 岛外扩像素数。过小可能出现接缝，过大可能侵入相邻 UV 岛。");
+    connect(padding, qOverload<int>(&QSpinBox::valueChanged), this, [this](int v){ m_settings.uvPaddingPixels = v; onSettingsChanged(); });
+    form->addRow("UV 岛扩边", padding);
     addSlider("细节保留", 0, 1, m_settings.detailPreserve, [this](float v){ m_settings.detailPreserve = v; onSettingsChanged(); });
     auto* keepSmooth = new QPushButton("保留光滑组 / 软硬边", this);
     keepSmooth->setCheckable(true);
@@ -886,13 +894,13 @@ QWidget* MainWindow::buildSettingsPanel() {
     connect(bChan, &QPushButton::toggled, this, [updateWriteChannels](bool){ updateWriteChannels(); });
     connect(aChan, &QPushButton::toggled, this, [updateWriteChannels](bool){ updateWriteChannels(); });
     auto* acceleration = new QComboBox(this);
-    acceleration->addItems({"自动", "BVH", "KD-Tree", "Embree 类 CPU", "GPU Compute 预留"});
+    acceleration->addItems({"自动", "BVH", "KD-Tree", "Embree 类 CPU", "GPU（尚未实现）"});
     acceleration->setCurrentText(m_settings.accelerationMode);
     connect(acceleration, &QComboBox::currentTextChanged, this, [this](const QString& v){
         m_settings.accelerationMode = v;
-        if (v == QStringLiteral("GPU Compute 预留")) {
+        if (v == QStringLiteral("GPU（尚未实现）")) {
             m_settings.gpuComputePreview = true;
-            log("GPU Compute 已作为商业版扩展入口预留；当前版本仍使用 CPU 加速结构执行。 ");
+            log("GPU 后端尚未实现；本次烘焙仍使用 CPU。该选项仅用于记录目标，不会启用 GPU 计算。");
         }
         onSettingsChanged();
     });
@@ -1821,7 +1829,7 @@ void MainWindow::runBake(bool texture) {
     testFile.remove();
 
     m_bakeRunning = true;
-    const auto beforeColors = m_viewport ? m_viewport->captureVertexColors() : QVector<QVector<QColor>>();
+    const auto beforeColors = (!texture && m_viewport) ? m_viewport->captureVertexColors() : QVector<QVector<QColor>>();
     QProgressDialog progress(texture ? "正在烘焙 AO 到贴图..." : "正在烘焙 AO 到顶点色...", "取消", 0, 100, this);
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(0);
@@ -1850,21 +1858,21 @@ void MainWindow::runBake(bool texture) {
             .arg(activeSettings.bakeBlockSize)
             .arg(activeSettings.cacheAccelerationStructure ? QStringLiteral("开") : QStringLiteral("关")));
 
-        baker.bakeToVertexColor(m_scene, activeSettings);
-        if (m_viewport) m_viewport->pushVertexColorUndo(beforeColors);
-        if (activeSettings.bakeScope == QStringLiteral("选中对象")) {
-            textureScene = buildSceneForSelectedMesh(m_scene, activeSettings.selectedMeshIndex);
-        } else if (activeSettings.bakeScope == QStringLiteral("可见对象")) {
-            textureScene = buildSceneForVisibleMeshes(m_scene);
+        QString modelOut;
+        QString message;
+        if (!texture) {
+            baker.bakeToVertexColor(m_scene, activeSettings);
+            if (m_viewport) m_viewport->pushVertexColorUndo(beforeColors);
+            modelOut = outputBaseName("_ao_vertex.glb");
+            ModelIO::exportModel(m_scene, modelOut, "glb2");
+            message = "模型已输出：\n" + modelOut;
+            m_lastBakeCachePath = modelOut;
+            addRecentFile(modelOut);
         } else {
-            textureScene = m_scene;
+            // Texture baking now evaluates AO independently at each covered texel;
+            // do not waste time baking vertex colors or mutate the source scene first.
+            message = "AO 逐纹素贴图烘焙完成。";
         }
-
-        const QString modelOut = outputBaseName(texture ? "_ao_texture.glb" : "_ao_vertex.glb");
-        ModelIO::exportModel(m_scene, modelOut, "glb2");
-        QString message = "模型已输出：\n" + modelOut;
-        m_lastBakeCachePath = modelOut;
-        addRecentFile(modelOut);
 
         if (texture) {
             progress.setLabelText("正在生成 AO 贴图...");
@@ -2553,7 +2561,7 @@ void MainWindow::openPreferences() {
     tabs->addTab(makeTab({"默认导入|保留 UV / 法线 / 顶点色", "默认导出|GLB", "导出内容|法线、UV、顶点色"}), "导入导出设置");
     tabs->addTab(makeTab({"采样数|" + QString::number(m_settings.sampleCount), "射线距离|" + QString::number(m_settings.rayDistance), "自适应采样|开启", "加速结构|" + m_settings.accelerationMode, "缓存加速结构|开启"}), "烘焙设置");
     tabs->addTab(makeTab({"画笔大小|24", "不透明度|1.0", "软笔刷|开启", "忽略背面|开启"}), "顶点绘制设置");
-    tabs->addTab(makeTab({"性能模式|平衡", "大模型策略|BVH/KD-Tree + 多线程 + 分块", "CPU方案|Embree 类遍历预设", "GPU Compute|扩展入口预留", "批处理失败|继续执行"}), "性能设置");
+    tabs->addTab(makeTab({"性能模式|平衡", "大模型策略|BVH/KD-Tree + 多线程 + 分块", "CPU方案|Embree 类遍历预设", "GPU 后端|尚未实现", "批处理失败|继续执行"}), "性能设置");
     tabs->addTab(makeTab({"撤销|Ctrl+Z", "重做|Ctrl+Y / Ctrl+Shift+Z", "聚焦模型|F"}), "快捷键设置");
     tabs->addTab(makeTab({"自动保存|开启", "自动恢复文件|autosave_recovery.aobproj", "保存间隔|退出和关键操作时"}), "自动保存设置");
     tabs->addTab(makeTab({"主题|深色", "Windows 标题栏|暗色适配", "高 DPI|开启"}), "主题设置");
@@ -3055,6 +3063,8 @@ void MainWindow::loadAppSettings() {
     m_settings.brightest = settings.value("ao/brightest", m_settings.brightest).toFloat();
     m_settings.sampleCount = settings.value("ao/samples", m_settings.sampleCount).toInt();
     m_settings.rayDistance = settings.value("ao/rayDistance", m_settings.rayDistance).toFloat();
+    m_settings.rayOriginOffset = settings.value("ao/rayOriginOffset", m_settings.rayOriginOffset).toFloat();
+    m_settings.uvPaddingPixels = settings.value("ao/uvPaddingPixels", m_settings.uvPaddingPixels).toInt();
     m_settings.detailPreserve = settings.value("ao/detailPreserve", m_settings.detailPreserve).toFloat();
     m_settings.accelerationMode = settings.value("ao/accelerationMode", m_settings.accelerationMode).toString();
     m_settings.multiThreadedBake = settings.value("ao/multiThreadedBake", m_settings.multiThreadedBake).toBool();
@@ -3110,6 +3120,8 @@ void MainWindow::saveAppSettings() const {
     settings.setValue("ao/brightest", m_settings.brightest);
     settings.setValue("ao/samples", m_settings.sampleCount);
     settings.setValue("ao/rayDistance", m_settings.rayDistance);
+    settings.setValue("ao/rayOriginOffset", m_settings.rayOriginOffset);
+    settings.setValue("ao/uvPaddingPixels", m_settings.uvPaddingPixels);
     settings.setValue("ao/detailPreserve", m_settings.detailPreserve);
     settings.setValue("ao/accelerationMode", m_settings.accelerationMode);
     settings.setValue("ao/multiThreadedBake", m_settings.multiThreadedBake);
@@ -3201,6 +3213,8 @@ QJsonObject MainWindow::saveProjectJson() const {
     settingsObj["brightest"] = m_settings.brightest;
     settingsObj["sampleCount"] = m_settings.sampleCount;
     settingsObj["rayDistance"] = m_settings.rayDistance;
+    settingsObj["rayOriginOffset"] = m_settings.rayOriginOffset;
+    settingsObj["uvPaddingPixels"] = m_settings.uvPaddingPixels;
     settingsObj["detailPreserve"] = m_settings.detailPreserve;
     settingsObj["textureResolution"] = m_settings.textureResolution;
     settingsObj["textureFormat"] = m_settings.textureFormat;
@@ -3330,6 +3344,8 @@ bool MainWindow::restoreProjectJson(const QJsonObject& root) {
         m_settings.brightest = float(settingsObj.value("brightest").toDouble(m_settings.brightest));
         m_settings.sampleCount = settingsObj.value("sampleCount").toInt(m_settings.sampleCount);
         m_settings.rayDistance = float(settingsObj.value("rayDistance").toDouble(m_settings.rayDistance));
+        m_settings.rayOriginOffset = float(settingsObj.value("rayOriginOffset").toDouble(m_settings.rayOriginOffset));
+        m_settings.uvPaddingPixels = std::clamp(settingsObj.value("uvPaddingPixels").toInt(m_settings.uvPaddingPixels), 0, 64);
         m_settings.detailPreserve = float(settingsObj.value("detailPreserve").toDouble(m_settings.detailPreserve));
         m_settings.textureResolution = settingsObj.value("textureResolution").toInt(m_settings.textureResolution);
         m_settings.textureFormat = settingsObj.value("textureFormat").toString(m_settings.textureFormat);

@@ -55,6 +55,9 @@ struct BakeSettings {
     float brightest = 1.00f;
     int sampleCount = 256;
     float rayDistance = 10.0f;
+    // Relative to scene bounding-box diagonal; avoids self-intersection at different model scales.
+    float rayOriginOffset = 0.0001f;
+    int uvPaddingPixels = 4;
     float detailPreserve = 0.80f;
     int textureResolution = 2048;
     QString textureFormat = "PNG";

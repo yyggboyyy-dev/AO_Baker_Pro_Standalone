@@ -32,6 +32,8 @@ qt_add_executable(AO_Baker_Pro_Standalone WIN32
     src/TextureRasterizer.cpp
     src/ViewportWidget.h
     src/ViewportWidget.cpp
+    src/GpuViewportRenderer.h
+    src/GpuViewportRenderer.cpp
 )
 
 target_link_libraries(AO_Baker_Pro_Standalone PRIVATE

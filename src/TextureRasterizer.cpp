@@ -9,7 +9,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <atomic>
+#include <thread>
+#include <numeric>
+#include <QVector3D>
 
 namespace {
 
@@ -295,52 +300,163 @@ void dilateUvIslands(QVector<float>& values, QVector<uchar>& mask, int resolutio
 
 } // namespace
 
-void TextureRasterizer::bakeAOTexture(const SceneData& scene, const QString& filePath, const BakeSettings& settings) {
-    const int res = settings.textureResolution;
-    QVector<float> values(res * res, 0.0f);
-    QVector<uchar> mask(res * res, 0);
-    bool anyUV = false;
+namespace {
+struct RayTriangle {
+    QVector3D p0, p1, p2;
+    QVector3D n0, n1, n2;
+    QVector3D geometricNormal;
+    QVector3D bmin, bmax, centroid;
+};
+struct RayNode {
+    QVector3D bmin, bmax;
+    int left=-1, right=-1, start=0, count=0;
+};
+struct PixelHit { int tri=-1; float b1=0.0f, b2=0.0f; };
 
-    for (const auto& mesh : scene.meshes) {
-        if (!mesh.hasUV) continue;
-        anyUV = true;
-        for (const auto& face : mesh.faces) {
-            const Vertex& v0 = mesh.vertices[face.i0];
-            const Vertex& v1 = mesh.vertices[face.i1];
-            const Vertex& v2 = mesh.vertices[face.i2];
-            const QPointF p0(v0.uv.x() * (res - 1), (1.0f - v0.uv.y()) * (res - 1));
-            const QPointF p1(v1.uv.x() * (res - 1), (1.0f - v1.uv.y()) * (res - 1));
-            const QPointF p2(v2.uv.x() * (res - 1), (1.0f - v2.uv.y()) * (res - 1));
+float component(const QVector3D& v, int axis) { return axis==0 ? v.x() : (axis==1 ? v.y() : v.z()); }
+QVector3D min3(const QVector3D& a,const QVector3D& b) { return {std::min(a.x(),b.x()),std::min(a.y(),b.y()),std::min(a.z(),b.z())}; }
+QVector3D max3(const QVector3D& a,const QVector3D& b) { return {std::max(a.x(),b.x()),std::max(a.y(),b.y()),std::max(a.z(),b.z())}; }
 
-            const int minX = std::max(0, int(std::floor(std::min({p0.x(), p1.x(), p2.x()}))));
-            const int maxX = std::min(res - 1, int(std::ceil(std::max({p0.x(), p1.x(), p2.x()}))));
-            const int minY = std::max(0, int(std::floor(std::min({p0.y(), p1.y(), p2.y()}))));
-            const int maxY = std::min(res - 1, int(std::ceil(std::max({p0.y(), p1.y(), p2.y()}))));
-            const float area = edge(p0, p1, p2);
-            if (std::abs(area) < 1e-6f) continue;
-
-            for (int y = minY; y <= maxY; ++y) {
-                for (int x = minX; x <= maxX; ++x) {
-                    const QPointF p(x + 0.5, y + 0.5);
-                    const float w0 = edge(p1, p2, p) / area;
-                    const float w1 = edge(p2, p0, p) / area;
-                    const float w2 = 1.0f - w0 - w1;
-                    if (w0 >= -1e-4f && w1 >= -1e-4f && w2 >= -1e-4f) {
-                        const float ao = std::clamp(w0 * v0.color.redF() + w1 * v1.color.redF() + w2 * v2.color.redF(), 0.0f, 1.0f);
-                        const int index = y * res + x;
-                        values[index] = ao;
-                        mask[index] = 255;
-                    }
-                }
+class TextureBvh {
+public:
+    explicit TextureBvh(const QVector<RayTriangle>& t): tris(t) {
+        indices.resize(tris.size()); std::iota(indices.begin(),indices.end(),0);
+        if (!indices.isEmpty()) { nodes.reserve(indices.size()*2); build(0,indices.size()); }
+    }
+    bool hit(const QVector3D& o,const QVector3D& d,float maxT) const {
+        if(nodes.isEmpty()) return false;
+        int stack[256]; int top=0; stack[top++]=0;
+        while(top) {
+            const RayNode& n=nodes[stack[--top]];
+            if(!boxHit(o,d,n.bmin,n.bmax,maxT)) continue;
+            if(n.left<0 && n.right<0) {
+                for(int i=0;i<n.count;++i) if(triHit(o,d,tris[indices[n.start+i]],maxT)) return true;
+            } else {
+                if(n.left>=0 && top<254) stack[top++]=n.left;
+                if(n.right>=0 && top<255) stack[top++]=n.right;
             }
         }
+        return false;
     }
-
-    if (!anyUV) {
-        throw std::runtime_error("没有可用于贴图烘焙的 UV 数据。");
+private:
+    QVector<RayTriangle> tris; QVector<int> indices; QVector<RayNode> nodes;
+    int build(int start,int count) {
+        RayNode n; n.start=start; n.count=count;
+        const float inf=std::numeric_limits<float>::max();
+        n.bmin={inf,inf,inf}; n.bmax={-inf,-inf,-inf};
+        QVector3D cmin(inf,inf,inf),cmax(-inf,-inf,-inf);
+        for(int i=start;i<start+count;++i) { const auto& t=tris[indices[i]]; n.bmin=min3(n.bmin,t.bmin); n.bmax=max3(n.bmax,t.bmax); cmin=min3(cmin,t.centroid); cmax=max3(cmax,t.centroid); }
+        const int id=nodes.size(); nodes.push_back(n);
+        if(count<=8) return id;
+        const QVector3D e=cmax-cmin; int axis=(e.y()>e.x() && e.y()>=e.z())?1:((e.z()>e.x() && e.z()>=e.y())?2:0);
+        if(component(e,axis)<1e-7f) return id;
+        const int mid=start+count/2;
+        std::nth_element(indices.begin()+start,indices.begin()+mid,indices.begin()+start+count,[&](int a,int b){return component(tris[a].centroid,axis)<component(tris[b].centroid,axis);});
+        nodes[id].left=build(start,mid-start); nodes[id].right=build(mid,start+count-mid); nodes[id].count=0; return id;
     }
+    static bool boxHit(const QVector3D& o,const QVector3D& d,const QVector3D& mn,const QVector3D& mx,float maxT) {
+        float lo=0.0f,hi=maxT;
+        for(int a=0;a<3;++a) { const float ov=component(o,a),dv=component(d,a),mnv=component(mn,a)-1e-5f,mxv=component(mx,a)+1e-5f;
+            if(std::abs(dv)<1e-9f) {if(ov<mnv||ov>mxv)return false;continue;}
+            float t0=(mnv-ov)/dv,t1=(mxv-ov)/dv;if(t0>t1)std::swap(t0,t1);lo=std::max(lo,t0);hi=std::min(hi,t1);if(hi<lo)return false;
+        } return hi>=0.0f;
+    }
+    static bool triHit(const QVector3D& o,const QVector3D& d,const RayTriangle& t,float maxT) {
+        const QVector3D e1=t.p1-t.p0,e2=t.p2-t.p0,p=QVector3D::crossProduct(d,e2); const float det=QVector3D::dotProduct(e1,p);
+        if(std::abs(det)<1e-7f)return false; const float inv=1.0f/det; const QVector3D tv=o-t.p0; const float u=QVector3D::dotProduct(tv,p)*inv;if(u<0||u>1)return false;
+        const QVector3D q=QVector3D::crossProduct(tv,e1);const float v=QVector3D::dotProduct(d,q)*inv;if(v<0||u+v>1)return false;
+        const float dist=QVector3D::dotProduct(e2,q)*inv;return dist>1e-4f&&dist<maxT;
+    }
+};
 
-    dilateUvIslands(values, mask, res, 4);
+QVector3D toWorld(const QVector3D& sample,const QVector3D& normal) {
+    QVector3D n=normal.normalized(); if(n.lengthSquared()<1e-8f)n={0,0,1};
+    const QVector3D helper=std::abs(QVector3D::dotProduct(n,{0,0,1}))>0.95f?QVector3D(1,0,0):QVector3D(0,0,1);
+    const QVector3D tangent=QVector3D::crossProduct(helper,n).normalized(); const QVector3D bitangent=QVector3D::crossProduct(n,tangent).normalized();
+    return (tangent*sample.x()+bitangent*sample.y()+n*sample.z()).normalized();
+}
+QVector<QVector3D> makeSamples(int count) {
+    QVector<QVector3D> out; count=std::clamp(count,1,4096);out.reserve(count);const float golden=2.39996322972865332f;
+    for(int i=0;i<count;++i){const float u=(i+0.5f)/float(count);const float z=std::sqrt(1.0f-u);const float r=std::sqrt(u);const float a=golden*float(i);out.push_back({std::cos(a)*r,std::sin(a)*r,z});}return out;
+}
+float remapVisibility(float v,const BakeSettings& s) {
+    v=std::clamp(v,0.0f,1.0f);v=std::pow(v,1.0f/std::max(s.transitionContrast,0.2f));const float sm=std::clamp(s.transitionSmoothness,0.0f,1.0f);const float smooth=v*v*(3.0f-2.0f*v);v=v*(1-sm)+smooth*sm;
+    v=1.0f-(1.0f-v)*std::max(0.0f,s.aoStrength);return std::clamp(s.darkest+(s.brightest-s.darkest)*std::clamp(v,0.0f,1.0f),0.0f,1.0f);
+}
+} // namespace
+
+void TextureRasterizer::bakeAOTexture(const SceneData& scene, const QString& filePath, const BakeSettings& settings) {
+    const int res = std::clamp(settings.textureResolution, 16, 8192);
+    const qint64 pixelCount = qint64(res) * qint64(res);
+    if (pixelCount > 20LL*1024*1024) throw std::runtime_error("贴图分辨率过高：当前逐纹素 CPU 路径预计会占用过多内存，请降低分辨率后重试。");
+    QVector<float> values(int(pixelCount), 1.0f);
+    QVector<uchar> mask(int(pixelCount), 0);
+    QVector<PixelHit> pixelHits; pixelHits.resize(int(pixelCount));
+    QVector<RayTriangle> triangles;
+    QVector<QVector<int>> faceRayIndices; faceRayIndices.resize(scene.meshes.size());
+    triangles.reserve(scene.faceCount());
+    bool anyUV=false;
+
+    // Build the occluder scene from all valid faces; UVs are only required for target triangles.
+    for(int mi=0; mi<scene.meshes.size(); ++mi) {
+      const auto& mesh=scene.meshes[mi]; faceRayIndices[mi].fill(-1, mesh.faces.size());
+      for(int fi=0; fi<mesh.faces.size(); ++fi) { const auto& f=mesh.faces[fi];
+        if(f.i0<0||f.i1<0||f.i2<0||f.i0>=mesh.vertices.size()||f.i1>=mesh.vertices.size()||f.i2>=mesh.vertices.size()) continue;
+        const Vertex& a=mesh.vertices[f.i0];const Vertex& b=mesh.vertices[f.i1];const Vertex& c=mesh.vertices[f.i2];
+        RayTriangle t; t.p0=a.position;t.p1=b.position;t.p2=c.position;
+        t.geometricNormal=QVector3D::crossProduct(t.p1-t.p0,t.p2-t.p0).normalized();if(t.geometricNormal.lengthSquared()<1e-8f)continue;
+        t.n0=a.normal.lengthSquared()>1e-8f?a.normal.normalized():t.geometricNormal;t.n1=b.normal.lengthSquared()>1e-8f?b.normal.normalized():t.geometricNormal;t.n2=c.normal.lengthSquared()>1e-8f?c.normal.normalized():t.geometricNormal;
+        t.bmin=min3(min3(t.p0,t.p1),t.p2);t.bmax=max3(max3(t.p0,t.p1),t.p2);t.centroid=(t.p0+t.p1+t.p2)/3.0f;faceRayIndices[mi][fi]=triangles.size();triangles.push_back(t);
+      }
+    }
+    if(triangles.isEmpty()) throw std::runtime_error("场景中没有有效三角面，无法计算 AO。");
+
+    // Rasterize UV triangles to per-texel surface records (triangle + barycentric coordinates).
+    for(int mi=0; mi<scene.meshes.size(); ++mi) {
+        const auto& mesh=scene.meshes[mi];
+        if(!mesh.hasUV) continue;
+        anyUV=true;
+        for(int fi=0; fi<mesh.faces.size(); ++fi) {
+            const auto& face=mesh.faces[fi];
+            if(face.i0<0||face.i1<0||face.i2<0||face.i0>=mesh.vertices.size()||face.i1>=mesh.vertices.size()||face.i2>=mesh.vertices.size()) {continue;}
+            const Vertex& v0=mesh.vertices[face.i0];const Vertex& v1=mesh.vertices[face.i1];const Vertex& v2=mesh.vertices[face.i2];
+            const QPointF p0(v0.uv.x()*(res-1),(1.0f-v0.uv.y())*(res-1)),p1(v1.uv.x()*(res-1),(1.0f-v1.uv.y())*(res-1)),p2(v2.uv.x()*(res-1),(1.0f-v2.uv.y())*(res-1));
+            const float area=edge(p0,p1,p2);if(std::abs(area)<1e-7f)continue;
+            const int minX=std::max(0,int(std::floor(std::min({p0.x(),p1.x(),p2.x()}))));const int maxX=std::min(res-1,int(std::ceil(std::max({p0.x(),p1.x(),p2.x()}))));
+            const int minY=std::max(0,int(std::floor(std::min({p0.y(),p1.y(),p2.y()}))));const int maxY=std::min(res-1,int(std::ceil(std::max({p0.y(),p1.y(),p2.y()}))));
+            const int rayTri=faceRayIndices[mi][fi];
+            if(rayTri<0)continue;
+            for(int y=minY;y<=maxY;++y)for(int x=minX;x<=maxX;++x){const QPointF p(x+0.5,y+0.5);const float b0=edge(p1,p2,p)/area,b1=edge(p2,p0,p)/area,b2=1.0f-b0-b1;
+                if(b0>=-1e-4f&&b1>=-1e-4f&&b2>=-1e-4f){const int idx=y*res+x;pixelHits[idx]={rayTri,b1,b2};mask[idx]=255;}}
+        }
+    }
+    if(!anyUV)throw std::runtime_error("没有可用于贴图烘焙的 UV 数据。");
+
+    TextureBvh bvh(triangles);
+    const QVector<QVector3D> samples=makeSamples(settings.sampleCount);
+    const float maxDistance=std::max(0.0001f,settings.rayDistance);
+    QVector3D sceneMin(std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
+    QVector3D sceneMax(-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max());
+    for (const RayTriangle& tri : triangles) { sceneMin = min3(sceneMin, tri.bmin); sceneMax = max3(sceneMax, tri.bmax); }
+    const float sceneScale = std::max((sceneMax - sceneMin).length(), 1.0e-3f);
+    const float rayBias = sceneScale * std::clamp(settings.rayOriginOffset, 1.0e-7f, 0.05f);
+    std::atomic<int> nextRow{0};
+    const unsigned int hw=std::max(1u,std::thread::hardware_concurrency());
+    const int threadCount=settings.multiThreadedBake?int(std::min<unsigned int>(hw,16u)):1;
+    auto worker=[&](){
+        while(true){const int y=nextRow.fetch_add(1);if(y>=res)break;
+            for(int x=0;x<res;++x){const int idx=y*res+x;if(!mask[idx])continue;const PixelHit& ph=pixelHits[idx];if(ph.tri<0||ph.tri>=triangles.size())continue;
+                const RayTriangle& t=triangles[ph.tri];const float b1=ph.b1,b2=ph.b2,b0=1.0f-b1-b2;
+                const QVector3D pos=t.p0*b0+t.p1*b1+t.p2*b2;QVector3D normal=(t.n0*b0+t.n1*b1+t.n2*b2).normalized();if(normal.lengthSquared()<1e-8f)normal=t.geometricNormal;
+                if(QVector3D::dotProduct(normal,t.geometricNormal)<0.0f)normal=-normal;
+                const QVector3D origin=pos+normal*rayBias;int blocked=0;
+                for(const QVector3D& sample:samples){const QVector3D dir=toWorld(sample,normal);if(bvh.hit(origin,dir,maxDistance))++blocked;}
+                const float visibility=1.0f-float(blocked)/float(samples.size());values[idx]=remapVisibility(visibility,settings);
+            }
+        }
+    };
+    QVector<std::thread> workers;workers.reserve(threadCount);for(int i=0;i<threadCount;++i)workers.emplace_back(worker);for(auto& t:workers)t.join();
+    dilateUvIslands(values,mask,res,std::clamp(settings.uvPaddingPixels, 0, 64));
 
     const QString fmt = settings.textureFormat.toUpper();
     const QString bitDepth = settings.textureBitDepth;

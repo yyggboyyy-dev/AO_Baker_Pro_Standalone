@@ -58,3 +58,7 @@ dist\AO_Baker_Pro_Standalone.exe
 ```bat
 packaging\package_release.bat
 ```
+
+## GPU Compute 视口要求
+
+本开发版会优先请求桌面 OpenGL 4.3 Core Profile。运行设备需要安装支持 OpenGL 4.3+ 的显卡驱动才能启用视口 Compute Shader；程序会在视口中显示检测状态。若上下文/着色器不支持，会尝试使用原 CPU 视口路径。当前 GPU Compute 仅用于 3D 视口投影与光栅化，AO 烘焙仍由 CPU 执行。由于当前开发容器缺少 Qt 6 SDK，此版本尚未完成 Windows 编译和 GPU 实机验证。
