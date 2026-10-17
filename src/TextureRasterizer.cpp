@@ -14,6 +14,7 @@
 #include <atomic>
 #include <thread>
 #include <numeric>
+#include <vector>
 #include <QVector3D>
 
 namespace {
@@ -455,7 +456,14 @@ void TextureRasterizer::bakeAOTexture(const SceneData& scene, const QString& fil
             }
         }
     };
-    QVector<std::thread> workers;workers.reserve(threadCount);for(int i=0;i<threadCount;++i)workers.emplace_back(worker);for(auto& t:workers)t.join();
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(threadCount));
+    for (int i = 0; i < threadCount; ++i) {
+        workers.emplace_back(worker);
+    }
+    for (auto& thread : workers) {
+        if (thread.joinable()) thread.join();
+    }
     dilateUvIslands(values,mask,res,std::clamp(settings.uvPaddingPixels, 0, 64));
 
     const QString fmt = settings.textureFormat.toUpper();

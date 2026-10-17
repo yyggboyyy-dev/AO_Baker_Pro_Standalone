@@ -57,3 +57,12 @@ cmake -S . -B build-audit -G Ninja -DCMAKE_BUILD_TYPE=Release
 - 静态顶点位置已在视口缓存中复用并以静态缓冲上传；预览颜色仍由 CPU 每帧准备并上传，AO 预览等模式下大场景仍可能受 CPU 数据准备影响。
 - 本容器缺少 Qt6 开发包，CMake 配置在 `find_package(Qt6)` 阶段失败，未完成 C++ 编译、Compute Shader 编译、GPU 实机帧率测试。
 - 需要在 Windows + OpenGL 4.3+ 设备上验证上下文创建、SSBO、线框状态、顶点绘制回退、DPI 缩放及性能；不应将此开发版标记为已通过运行时测试。
+
+
+## Windows CI 编译错误修复（2026-10-17）
+
+根据 MSVC 17.14 的 CI 日志修复：
+
+- `TextureRasterizer.cpp` 原先将 `std::thread` 放进 `QVector`。Qt 容器在相关操作中要求元素可复制，而 `std::thread` 不可复制，导致 C2280。现改为 `std::vector<std::thread>`，显式启动并 join 线程。
+- 删除 CMake 命令行中未被项目使用的 `VCPKG_BUILD_TYPE`。该变量不是本项目的 CMake 选项；vcpkg triplet 继续由 `VCPKG_TARGET_TRIPLET=x64-windows-static` 控制。
+- 此修复针对日志中的编译错误；必须重新运行 Windows CI 才能确认是否还有后续编译或链接错误。
